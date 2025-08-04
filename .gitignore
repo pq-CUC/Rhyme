@@ -1,7 +1,7 @@
 # Build artifacts from Rhyme implementation
-ref8.1(end.git)/build/
-ref8.1(end.git)/bin/
-ref8.1(end.git)/libs/
+ref/build/
+ref/bin/
+ref/libs/
 *.a
 *.so
 *.dylib
@@ -31,3 +31,4 @@ __pycache__/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
