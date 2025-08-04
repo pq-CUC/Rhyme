@@ -1,0 +1,33 @@
+# Build artifacts from Rhyme implementation
+ref8.1(end.git)/build/
+ref8.1(end.git)/bin/
+ref8.1(end.git)/libs/
+*.a
+*.so
+*.dylib
+*.dll
+*.o
+*.out
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+
+# Test files
+*.req
+*.rsp
+
+# Python caches from lattice-estimator
+__pycache__/
+*.pyc
+
+# OS-generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

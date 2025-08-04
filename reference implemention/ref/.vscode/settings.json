@@ -1,0 +1,14 @@
+{
+    "files.associations": {
+        "fips202.h": "c",
+        "inttypes.h": "c",
+        "reduce.h": "c",
+        "params.h": "c",
+        "config.h": "c",
+        "rans_tables_tau128.h": "c",
+        "vector": "c",
+        "ntt.h": "c",
+        "sign.h": "c",
+        "sampler.h": "c"
+    }
+}
