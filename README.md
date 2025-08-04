@@ -18,7 +18,7 @@ This repository is organized as follows:
 
 -   `reference implemention/ref/`: The core source code for the Rhyme signature scheme.
 -   `security estimation/`: A copy of the [Lattice Estimator](https://github.com/malb/lattice-estimator) tool, used for security analysis of the Rhyme parameter sets. Please see the `README.md` inside this directory for original author and license information.
--   `my-lwe-tests/`: Contains the specific scripts used to evaluate Rhyme's security with the Lattice Estimator.
+-   `my-tests/`: Contains the specific scripts used to evaluate Rhyme's security with the Lattice Estimator.
 
 ### Build and Run
 
@@ -51,7 +51,7 @@ The project uses CMake for building.
 
 ### Security Analysis
 
-The security of the Rhyme parameter sets against known lattice attacks has been analyzed using the Lattice Estimator. The analysis script is `my-lwe-tests/test_my_params.py`.
+The security of the Rhyme parameter sets against known lattice attacks has been analyzed using the Lattice Estimator. The analysis script is `my-tests/test_my_params.py`.
 
 ### License
 
