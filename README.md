@@ -16,8 +16,8 @@ The 3C sampling technique generates the masking vector `y` without using rejecti
 
 This repository is organized as follows:
 
--   `reference implemention/ref/`: The core source code for the Rhyme signature scheme.
--   `security estimation/`: A copy of the [Lattice Estimator](https://github.com/malb/lattice-estimator) tool, used for security analysis of the Rhyme parameter sets. Please see the `README.md` inside this directory for original author and license information.
+-   `Reference implementation/ref/`: The core source code for the Rhyme signature scheme.
+-   `Security estimation/`: A copy of the [Lattice Estimator](https://github.com/malb/lattice-estimator) tool, used for security analysis of the Rhyme parameter sets. Please see the `README.md` inside this directory for original author and license information.
 -   `my-tests/`: Contains the specific scripts used to evaluate Rhyme's security with the Lattice Estimator.
 
 ### Build and Run
@@ -34,7 +34,7 @@ The project uses CMake for building.
 
 1.  **Navigate to the implementation directory:**
     ```bash
-    cd "reference implemention/ref"
+    cd "Reference implementation/ref"
     ```
 
 2.  **Create a build directory:**
@@ -47,7 +47,7 @@ The project uses CMake for building.
     cmake --build build --clean-first
     ```
 
-    The compiled binaries will be located in the `reference implemention/ref/build/bin/` directory.
+    The compiled binaries will be located in the `Reference implementation/ref/build/bin/` directory.
 
 ### Security Analysis
 
@@ -55,4 +55,4 @@ The security of the Rhyme parameter sets against known lattice attacks has been 
 
 ### License
 
-The code in the `reference implemention/ref` directory is licensed under the MIT License. See the [LICENSE](LICENSE) file for details. The `security estimation` directory contains third-party code under its own license.
+The code in the `Reference implementation/ref` directory is licensed under the MIT License. See the [LICENSE](LICENSE) file for details. The `Security estimation` directory contains third-party code under its own license.
