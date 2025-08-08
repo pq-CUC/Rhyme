@@ -143,17 +143,20 @@ void SampleX_poly(poly *x, const poly *c, const uint8_t seed[CRHBYTES], uint16_t
     size_t buf_pos = STREAM256_BLOCKBYTES * 8;
     stream256_state state;
     stream256_init(&state, seed, nonce);
+
     for (int i = 0; i < N; ++i) {
-        int32_t ci = c->coeffs[i];
-        int32_t xi = 0;
-        if (ci == 0) {
-            xi = 0;
-        } else {
-            uint8_t rd_bit1 = get_random_bit(&state, buf, &buf_len, &buf_pos);
-            if (rd_bit1 == 0) xi = -2;
-            else xi = 0;
-        }
-        x->coeffs[i] = xi;
+
+        uint8_t r = get_random_bit(&state, buf, &buf_len, &buf_pos);
+
+        // r=0 -> value=-2; r=1 -> value=0
+        int32_t value = (1 - r) * -2;
+
+        // ci=0 -> mask=0; ci=1 -> mask=-1 
+        int32_t mask = -c->coeffs[i];
+
+        // ci=0 -> xi = 0 & value = 0
+        // ci=1 -> xi = -1 & value = value
+        x->coeffs[i] = mask & value;
     }
 }
 
@@ -171,19 +174,14 @@ void SampleX_poly(poly *x, const poly *c, const uint8_t seed[CRHBYTES], uint16_t
 * Returns:     A single coefficient sampled from Chi(0,1).
 **************************************************/
 static int32_t sample_chi_0_1(stream256_state *state, uint8_t *buf, size_t *buf_len, size_t *buf_pos) {
-    // Need 2 random bits to distinguish 3 outcomes with these probabilities
     uint8_t bit1 = get_random_bit(state, buf, buf_len, buf_pos);
     uint8_t bit2 = get_random_bit(state, buf, buf_len, buf_pos);
 
-    // Map the 4 possible bit combinations (00, 01, 10, 11) to the desired outputs
-    if (bit1 == 0 && bit2 == 0) {
-        return -1; // Probability 1/4 for '00'
-    } else if (bit1 == 1 && bit2 == 1) {
-        return 1;  // Probability 1/4 for '11'
-    } else {
-        // Cases '01' and '10' (total probability 1/2) map to 0
-        return 0;
-    }
+    int32_t selection_mask = (bit1 ^ bit2) - 1;
+
+    int32_t value = (bit1 * 2) - 1;
+
+    return selection_mask & value;
 }
 
 /*************************************************

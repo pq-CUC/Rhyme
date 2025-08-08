@@ -264,7 +264,7 @@ void poly_mul(poly *c, const poly *a, const poly *b) {
 
     // Schoolbook multiplication
     for (i = 0; i < N; ++i) {
-        if (a->coeffs[i] == 0) continue; // Optimization
+        //if (a->coeffs[i] == 0) continue; // Optimization
         for (j = 0; j < N; ++j) {
             res[i + j] += (int64_t)a->coeffs[i] * b->coeffs[j];
         }
