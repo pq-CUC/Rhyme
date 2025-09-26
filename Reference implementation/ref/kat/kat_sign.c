@@ -11,6 +11,6 @@ int kat_crypto_sign(uint8_t *sm, size_t *smlen, const uint8_t *m, size_t mlen,
 }
 
 int kat_crypto_sign_open(uint8_t *m, size_t *mlen, const uint8_t *sm,
-                         size_t smlen, const uint8_t *pk) {
-    return crypto_sign_open(m, mlen, sm, smlen, pk);
+                         size_t smlen, const uint8_t *pk, size_t pklen) {
+    return crypto_sign_open(m, mlen, sm, smlen, pk, pklen);
 }

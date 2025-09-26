@@ -8,15 +8,11 @@
 #include <stdio.h>
 #include "encoding.h" 
 
-#define PK_LEN_BYTES 2
-#define SK_PK_LEN_BYTES 2
-
-
 /*************************************************
 * Name:        pack_pk
 *
-* Description: Packs the public key into a byte array.
-* The format is | 2-byte data_len | seedA | encoded vector b |.
+* Description: Packs the public key into a byte array without a length field.
+* The format is | seedA | fixed-size main data | overflow data |.
 *
 * Arguments:   - uint8_t *pk: pointer to output byte array
 * - const uint8_t seedA[]: pointer to seed for matrix A
@@ -25,20 +21,26 @@
 * Returns:     The total number of bytes written to pk.
 **************************************************/
 size_t pack_pk(uint8_t *pk, const uint8_t seedA[SEEDBYTES], const polyveck *b) {
-    uint8_t *pk_ptr = pk + PK_LEN_BYTES; 
-    uint8_t main_buf[K * N];
-    uint8_t overflow_buf[(K * N + 7) / 8] = {0}; 
-    int total_overflow_bits = 0;
-    size_t total_main_len = 0;
+    uint8_t *pk_ptr = pk;
+    
+    // 1. Copy seedA
+    memcpy(pk_ptr, seedA, SEEDBYTES);
+    pk_ptr += SEEDBYTES;
 
+    // 2. Prepare pointers for fixed-size main data and temporary overflow buffer
+    uint8_t *main_buf_ptr = pk_ptr;
+    uint8_t overflow_buf[(K * N + 7) / 8] = {0};
+    int total_overflow_bits = 0;
+
+    // 3. Process all polynomials into a fixed-size main area and a variable overflow area
     for (int i = 0; i < K; ++i) {
         const poly *p = &b->vec[i];
         for (int j = 0; j < N; ++j) {
             int32_t coeff = p->coeffs[j];
             if (coeff < 255) {
-                main_buf[total_main_len++] = (uint8_t)coeff;
+                main_buf_ptr[i * N + j] = (uint8_t)coeff;
             } else {
-                main_buf[total_main_len++] = 0xFF; 
+                main_buf_ptr[i * N + j] = 0xFF; // Mark as overflow
                 if (coeff == 256) {
                     overflow_buf[total_overflow_bits / 8] |= (1 << (total_overflow_bits % 8));
                 }
@@ -47,25 +49,22 @@ size_t pack_pk(uint8_t *pk, const uint8_t seedA[SEEDBYTES], const polyveck *b) {
         }
     }
 
+    // 4. Advance pointer past the fixed-size main data area
+    pk_ptr += K * N;
+
+    // 5. Append the overflow data
     size_t overflow_byte_len = (total_overflow_bits + 7) / 8;
-    size_t data_len = SEEDBYTES + total_main_len + overflow_byte_len;
-
-    pk[0] = (uint8_t)(data_len & 0xFF);
-    pk[1] = (uint8_t)((data_len >> 8) & 0xFF);
-    
-    memcpy(pk_ptr, seedA, SEEDBYTES);
-    pk_ptr += SEEDBYTES;
-    memcpy(pk_ptr, main_buf, total_main_len);
-    pk_ptr += total_main_len;
     memcpy(pk_ptr, overflow_buf, overflow_byte_len);
+    pk_ptr += overflow_byte_len;
 
-    return PK_LEN_BYTES + data_len;
+    // 6. Return the total actual size
+    return (size_t)(pk_ptr - pk);
 }
 
 /*************************************************
 * Name:        unpack_pk
 *
-* Description: Unpacks a public key from a byte array.
+* Description: Unpacks a public key from a byte array that has no length field.
 *
 * Arguments:   - uint8_t seedA[]: pointer to output seed for matrix A
 * - polyveck *b: pointer to output polynomial vector b
@@ -75,41 +74,41 @@ size_t pack_pk(uint8_t *pk, const uint8_t seedA[SEEDBYTES], const polyveck *b) {
 * Returns:     0 on success, non-zero on failure.
 **************************************************/
 int unpack_pk(uint8_t seedA[SEEDBYTES], polyveck *b, const uint8_t *pk, size_t pklen) {
-    if (pklen < PK_LEN_BYTES) return -1;
-    size_t data_len = (uint16_t)pk[0] | ((uint16_t)pk[1] << 8);
-    if (pklen != PK_LEN_BYTES + data_len) return -1; 
+    if (pklen < SEEDBYTES + (size_t)K * N) return -1; // Basic check for minimal possible size
 
-    const uint8_t *pk_ptr = pk + PK_LEN_BYTES;
-    const uint8_t *data_end_ptr = pk_ptr + data_len;
-    
-    if (data_len < SEEDBYTES) return -2;
+    const uint8_t *pk_ptr = pk;
+
+    // 1. Unpack seedA
     memcpy(seedA, pk_ptr, SEEDBYTES);
-    pk_ptr += SEEDBYTES;    
-    const uint8_t *scan_ptr = pk_ptr;
+    pk_ptr += SEEDBYTES;
+
+    // 2. Scan the fixed-size main data area to determine overflow length
+    const uint8_t *main_buf_ptr = pk_ptr;
     int total_overflow_bits = 0;
-    while(scan_ptr < data_end_ptr) {
-      
-        
-        if (*scan_ptr++ == 0xFF) {
+    for (size_t i = 0; i < (size_t)K * N; ++i) {
+        if (main_buf_ptr[i] == 0xFF) {
             total_overflow_bits++;
         }
     }
+    
     size_t overflow_byte_len = (total_overflow_bits + 7) / 8;
-    size_t main_len = data_len - SEEDBYTES - overflow_byte_len;
+    
+    // 3. Verify consistency of the provided pklen
+    if (pklen != SEEDBYTES + (size_t)K * N + overflow_byte_len) {
+        return -2; // Length mismatch
+    }
 
-    
-    const uint8_t *overflow_buf_ptr = pk_ptr + main_len;
+    // 4. Set pointer to the start of the overflow data
+    const uint8_t *overflow_buf_ptr = main_buf_ptr + K * N;
     int overflow_bit_pos = 0;
-    
-    
-    for(int i = 0; i < K; ++i) {
+
+    // 5. Reconstruct the polynomial vector b
+    for (int i = 0; i < K; ++i) {
         poly *p = &b->vec[i];
-        for(int j = 0; j < N; ++j) {
-            if (pk_ptr >= overflow_buf_ptr) return -3; 
-            
-            uint8_t byte = *pk_ptr++;
+        for (int j = 0; j < N; ++j) {
+            uint8_t byte = main_buf_ptr[i * N + j];
             if (byte == 0xFF) {
-                if ((size_t)(overflow_bit_pos / 8) >= overflow_byte_len) return -4;
+                if ((size_t)(overflow_bit_pos / 8) >= overflow_byte_len) return -3; // Malformed data
                 
                 int bit = (overflow_buf_ptr[overflow_bit_pos / 8] >> (overflow_bit_pos % 8)) & 1;
                 overflow_bit_pos++;
@@ -126,28 +125,15 @@ int unpack_pk(uint8_t seedA[SEEDBYTES], polyveck *b, const uint8_t *pk, size_t p
 /*************************************************
 * Name:        pack_sk
 *
-* Description: Packs the secret key into a byte array.
-* The format is | packed pk | packed s_gen | packed e_gen |
-* | packed s_prime | packed s_bar_prime_0 | key |.
-*
-* Arguments:   - uint8_t *sk: pointer to output byte array
-* - const uint8_t *pk: pointer to the packed public key
-* - size_t pklen: length of the packed public key
-* - const polyvecm *s_gen: pointer to vector s_gen
-* - const polyveck *e_gen: pointer to vector e_gen
-* - const polyvecl *s_prime: pointer to vector s'
-* - const poly *s_bar_prime_0: pointer to s_bar_prime_0
-* - const uint8_t key[]: pointer to the secret key seed
-*
-* Returns:     The total number of bytes written to sk.
+* Description: Packs the secret key.
 **************************************************/
-size_t pack_sk(uint8_t *sk, const uint8_t *pk, size_t pklen, const polyvecm *s_gen, const polyveck *e_gen, const polyvecl *s_prime, const poly *s_bar_prime_0, const uint8_t key[SEEDBYTES]) {    uint8_t *sk_ptr = sk;
+size_t pack_sk(uint8_t *sk, const uint8_t *pk, size_t pklen, const polyvecm *s_gen, const polyveck *e_gen, const polyvecl *s_prime, const poly *s_bar_prime_0, const uint8_t key[SEEDBYTES]) {
+    uint8_t *sk_ptr = sk;
     const size_t sgen_bytes = M * POLYSIGMA1_PACKEDBYTES;
     const size_t egen_bytes = K * POLYSIGMA1_PACKEDBYTES;
     const size_t sprime_bytes = S_PRIME_PACKEDBYTES;
     const size_t s_bar_prime_bytes = S_BAR_PRIME_0_PACKEDBYTES; 
 
-    
     memcpy(sk_ptr, pk, pklen);
     sk_ptr += pklen;
     pack_polyvecm_sigma1(sk_ptr, s_gen);
@@ -185,37 +171,35 @@ size_t pack_sk(uint8_t *sk, const uint8_t *pk, size_t pklen, const polyvecm *s_g
 /*************************************************
 * Name:        unpack_sk
 *
-* Description: Unpacks a secret key from a byte array.
-*
-* Arguments:   - uint8_t *pk: pointer to output packed public key
-* - size_t *pklen: pointer to output length of public key
-* - polyvecm *s_gen: pointer to output vector s_gen
-* - polyveck *e_gen: pointer to output vector e_gen
-* - polyvecl *s_prime: pointer to output vector s'
-* - poly *s_bar_prime_0: pointer to output s_bar_prime_0
-* - uint8_t key[]: pointer to output secret key seed
-* - const uint8_t *sk: pointer to input byte array
-* - size_t sklen: length of the input byte array
-*
-* Returns:     0 on success, non-zero on failure.
+* Description: Unpacks a secret key.
 **************************************************/
-int unpack_sk(uint8_t *pk, size_t *pklen, polyvecm *s_gen, polyveck *e_gen, polyvecl *s_prime, poly *s_bar_prime_0, uint8_t key[SEEDBYTES], const uint8_t *sk, size_t sklen) {    const uint8_t *sk_ptr = sk;
+int unpack_sk(uint8_t *pk, size_t *pklen, polyvecm *s_gen, polyveck *e_gen, polyvecl *s_prime, poly *s_bar_prime_0, uint8_t key[SEEDBYTES], const uint8_t *sk, size_t sklen) {
+    const uint8_t *sk_ptr = sk;
     const size_t sgen_bytes = M * POLYSIGMA1_PACKEDBYTES;
     const size_t egen_bytes = K * POLYSIGMA1_PACKEDBYTES;
     const size_t sprime_bytes = S_PRIME_PACKEDBYTES; 
-    const size_t s_bar_prime_bytes = S_BAR_PRIME_0_PACKEDBYTES; 
+    const size_t s_bar_prime_bytes = S_BAR_PRIME_0_PACKEDBYTES;
 
+    // --- Start of modification ---
+    // Deduce the length of the embedded public key
+    if (sklen < SEEDBYTES + (size_t)K * N) return -1; // Not enough data for even a minimal PK
     
-    if (sklen < PK_LEN_BYTES) return -1;
-    size_t embedded_pklen_data = (uint16_t)sk_ptr[0] | ((uint16_t)sk_ptr[1] << 8);
-    size_t embedded_pklen_total = PK_LEN_BYTES + embedded_pklen_data;
+    const uint8_t *main_buf_ptr = sk_ptr + SEEDBYTES;
+    int total_overflow_bits = 0;
+    for (size_t i = 0; i < (size_t)K * N; ++i) {
+        if (main_buf_ptr[i] == 0xFF) {
+            total_overflow_bits++;
+        }
+    }
+    size_t overflow_byte_len = (total_overflow_bits + 7) / 8;
+    size_t embedded_pklen = SEEDBYTES + (size_t)K * N + overflow_byte_len;
 
-    if (sklen < embedded_pklen_total) return -1;
-    *pklen = embedded_pklen_total;
+    if (sklen < embedded_pklen) return -1; // sklen too short for the deduced pklen
+    *pklen = embedded_pklen;
     memcpy(pk, sk_ptr, *pklen);
     sk_ptr += *pklen;
+    // --- End of modification ---
 
-    
     if ((size_t)(sk_ptr - sk) + sgen_bytes + egen_bytes + sprime_bytes + SEEDBYTES > sklen) return -1;
     unpack_polyvecm_sigma1(s_gen, sk_ptr);
     sk_ptr += sgen_bytes;

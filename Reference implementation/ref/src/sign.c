@@ -398,7 +398,7 @@ int crypto_sign_sign(uint8_t *sm, size_t *smlen, const uint8_t *m, size_t mlen,
 * Returns:     0 on success, -1 on failure.
 **************************************************/
  int crypto_sign_open(uint8_t *m, size_t *mlen, const uint8_t *sm, size_t smlen,
-                     const uint8_t *pk)
+                     const uint8_t *pk, const size_t pklen)
 {
     const size_t siglen_field_bytes = sizeof(uint16_t); 
     size_t actual_siglen;
@@ -423,11 +423,7 @@ int crypto_sign_sign(uint8_t *sm, size_t *smlen, const uint8_t *m, size_t mlen,
     const uint8_t *message_ptr = sm + siglen_field_bytes;
     const uint8_t *sig_ptr = sm + siglen_field_bytes + calculated_mlen; 
 
-    size_t pklen_data = (uint16_t)pk[0] | ((uint16_t)pk[1] << 8);
-    size_t pklen_total = 2 + pklen_data;
-    
-    if (crypto_sign_verify(sig_ptr, actual_siglen, message_ptr, calculated_mlen, pk, pklen_total) != 0) {
-        
+    if (crypto_sign_verify(sig_ptr, actual_siglen, message_ptr, calculated_mlen, pk, pklen) != 0) {
         return -1; 
     }
 

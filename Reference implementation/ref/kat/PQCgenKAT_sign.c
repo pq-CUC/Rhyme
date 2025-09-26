@@ -172,7 +172,7 @@ int main(int argc, const char **argv) {
 
         
         
-        if ((ret_val = kat_crypto_sign_open(m1, &mlen1, sm, smlen, pk)) != 0) {
+        if ((ret_val = kat_crypto_sign_open(m1, &mlen1, sm, smlen, pk, pklen)) != 0) {
             printf("kat_crypto_sign_open returned <%d> (count=%d)\n", ret_val, count);
              fclose(fp_req); fclose(fp_rsp); free(m); free(m1); free(sm); return KAT_CRYPTO_FAILURE;
         }
