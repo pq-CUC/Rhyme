@@ -1,8 +1,5 @@
 # Rhyme: A Fiat-Shamir Lattice-based Signature with 3C Sampling
 
-This repository contains the reference implementation of the **Rhyme** digital signature scheme, presented in the paper below.
-
-**Paper:** [https://eprint.iacr.org/2025/1350.pdf](https://eprint.iacr.org/2025/1350.pdf)
 
 ---
 
