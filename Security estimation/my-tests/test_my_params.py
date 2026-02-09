@@ -15,9 +15,9 @@ print("="*60)
 
 # 2. Define the three parameter sets for Rhyme
 rhyme_params = {
-    "Rhyme-128": {"n_ring": 256, "k": 2, "l": 3, "B": 32, "q": 257},
-    "Rhyme-192": {"n_ring": 256, "k": 3, "l": 4, "B": 48, "q": 257},
-    "Rhyme-256": {"n_ring": 256, "k": 4, "l": 5, "B": 60, "q": 257}
+    "Rhyme-128": {"n_ring": 256, "k": 2, "l": 3, "B": 30, "q": 257},
+    "Rhyme-192": {"n_ring": 256, "k": 3, "l": 4, "B": 42, "q": 257},
+    "Rhyme-256": {"n_ring": 256, "k": 4, "l": 5, "B": 56, "q": 257}
 }
 
 # 3. Loop through each parameter set and evaluate it
