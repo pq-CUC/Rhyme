@@ -7,7 +7,7 @@
 
 The core innovation of Rhyme is the **Convolution of Constant Counts Sampling (3C Sampling)** method. In lattice-based Fiat-Shamir signatures, preventing the signature from leaking the secret key is a central challenge.
 
-The 3C sampling technique generates the masking vector `y` without using rejection sampling, through the convolution of several carefully chosen symmetric distributions. This design ensures that the output signature distribution is naturally independent of the secret key, thus preventing key leakage in the Fiat-Shamir structure.
+The 3C sampling technique constructs the signature vector `z` using a hybrid approach: it employs **lightweight, localized rejection sampling** solely for the first component ($z_0$) to decouple it from the shared mask, while the remaining components are generated through the **convolution of several carefully chosen symmetric distributions**. This design ensures that the final signature distribution is inherently independent of the secret key without relying on the expensive, full-dimensional rejection sampling used in schemes like Dilithium.
 
 ### Directory Structure
 
