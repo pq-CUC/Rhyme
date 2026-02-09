@@ -40,6 +40,8 @@ static void randomize_polyvecm(polyvecm *v) {
     for(int i=0; i<M; ++i) randomize_poly(&v->vec[i]);
 }
 
+//extern unsigned long long global_sign_cycles_count;
+
 int main() {
     
     uint8_t pk[CRYPTO_PUBLICKEYBYTES];
@@ -63,15 +65,16 @@ int main() {
     uint8_t seed_x_prime2[CRHBYTES]; 
     uint8_t seed_s_prime[CRHBYTES]; 
 
-    polyveck b; 
+polyveck b; 
     polyvecm sgen; 
     polyveck egen; 
     polyvecl s_prime; 
     poly s_bar_prime_0; 
-    polyvecl z; 
+
     poly c; 
     poly x_poly; 
     polyvecl y; 
+
     polyveck temp_veck; 
     polyvecl temp_vecl; 
     poly test_poly_a, test_poly_b, test_poly_res; 
@@ -81,6 +84,9 @@ int main() {
     poly c_plus_x, c_plus_x_ntt; 
     polyvecl S_c_plus_x; 
 
+    poly z0, z0_unpacked;
+    polyvecd_rest z_rest, z_rest_unpacked;
+    poly c_unpacked;
 
     printf("Benchmarking CCC implementation (based on ccc_MODE=%d)\n", ccc_MODE);
     printf("Parameters: N=%d, Q=%d, K=%d, L=%d (L+K=%d, M=%d), TAU=%d, B_INFTY=%d\n", N, Q, K, L, L+K, M, TAU, B_INFTY);
@@ -118,18 +124,28 @@ int main() {
 
     // Signature Generation
     crypto_sign_keypair(pk, &pklen, sk, &sklen);// Need a valid keypair first
+    crypto_sign_signature(sig, &siglen, msg, sizeof(msg), sk);
+
+
+    //global_sign_cycles_count = 0;
+
+
     srt = clock();
     for (i = 0; i < NTESTS; ++i) {
         t[i] = cpucycles();
         // Assume crypto_sign_signature uses the modified SampleY internally correctly
-        crypto_sign_signature(sig, &siglen, msg, sizeof(msg), sk);
+        crypto_sign_signature(sig, &siglen, sig, sizeof(msg), sk);
     }
     ed = clock();
     print_results("crypto_sign_signature", t, NTESTS);
     time_avg = (long double)(ed - srt) * 1000.0 / CLOCKS_PER_SEC / NTESTS;
     printf("  Approx time: %.4Lf ms\n\n", time_avg);
 
+    // double avg_iter = (double)global_sign_cycles_count / NTESTS;
+    // printf("  Average iterations per signature: %.2f\n", avg_iter);
+    // printf("  Average rejections per signature: %.2f\n\n", avg_iter - 1.0);
 
+    
     // Signature Verification
     // Ensure a valid signature exists for verification benchmark
     if (crypto_sign_signature(sig, &siglen, msg, sizeof(msg), sk) != 0) {
@@ -213,12 +229,11 @@ int main() {
     }
     print_results("SampleX_poly", t, NTESTS);
 
-    // **** Benchmark SampleY (with corrected call) ****
+    /* Benchmark SampleY */
     srt = clock();
     for (i = 0; i < NTESTS; ++i) {
         nonce = (uint16_t)i; // Use i as nonce variation
         t[i] = cpucycles();
-        // **** Corrected SampleY call with 9 arguments ****
         SampleY(&y, &s_prime, &s_bar_prime_0,
             seed_y1,
             seed_c_prime,
@@ -231,7 +246,6 @@ int main() {
     print_results("SampleY (3C Sampling - Corrected Call)", t, NTESTS);
     time_avg = (long double)(ed - srt) * 1000.0 / CLOCKS_PER_SEC / NTESTS;
     printf("  Approx time: %.4Lf ms\n\n", time_avg);
-    // --- End SampleY Benchmark ---
 
     // NTT domain computation of s*(c+x)
     // Prepare inputs (outside timing loop)
@@ -265,6 +279,68 @@ int main() {
         }
      }
     print_results("poly_pointwise_montgomery loop (NTT(s)*NTT(c+x))", t, NTESTS);
+
+/* ----------------------------------------------------------------------
+   Comparison of methods for calculating s * (c + x)
+   ---------------------------------------------------------------------- */
+    printf("\n--- s * (c + x) Calculation Methods Comparison ---\n");
+
+    // Prepare buffers
+    polyvecl res_vec;
+    poly temp_poly;
+
+    // -----------------------------------------------------------
+    // Method 1: Full NTT Approach
+    // Assumption: s is already in NTT domain (s_ntt), but c+x is fresh and needs NTT.
+    // Steps: NTT(c+x) -> Pointwise Mul -> InvNTT(result)
+    // -----------------------------------------------------------
+    for (i = 0; i < NTESTS; ++i) {
+        t[i] = cpucycles();
+        
+        // 1. NTT of (c+x)
+        temp_poly = c_plus_x; // Copy fresh c+x
+        poly_ntt(&temp_poly);
+        
+        // 2. Pointwise Multiply & 3. Inverse NTT
+        for (int j = 0; j < L + K; ++j) {
+            poly_pointwise_montgomery(&res_vec.vec[j], &s_ntt.vec[j], &temp_poly);
+            poly_invntt_tomont(&res_vec.vec[j]);
+        }
+    }
+    print_results("Method 1: Full NTT (NTT(c+x) + Mul + InvNTT)", t, NTESTS);
+
+    // -----------------------------------------------------------
+    // Method 2: Karatsuba (Current Implementation)
+    // Uses poly_mul_integer with pre-calculated (c+x)
+    // -----------------------------------------------------------
+    for (i = 0; i < NTESTS; ++i) {
+        t[i] = cpucycles();
+        
+        // Loop over all components of vector s
+        for (int j = 0; j < L + K; ++j) {
+            // Note: s.vec[j] is in normal domain, c_plus_x is normal
+            poly_mul_integer(&res_vec.vec[j], &s.vec[j], &c_plus_x);
+        }
+    }
+    print_results("Method 2: Karatsuba (poly_mul_integer)", t, NTESTS);
+
+    // -----------------------------------------------------------
+    // Method 3: Sparse Ternary (Optimized)
+    // Uses poly_mul_sparse_ternary directly with c and x
+    // -----------------------------------------------------------
+    for (i = 0; i < NTESTS; ++i) {
+        t[i] = cpucycles();
+        
+        // Loop over all components of vector s
+        for (int j = 0; j < L + K; ++j) {
+            // Directly use sparse c and x. No need to pre-calc c+x
+            poly_mul_sparse_ternary(&res_vec.vec[j], &s.vec[j], &c, &x_poly);
+        }
+    }
+    print_results("Method 3: Sparse Ternary (poly_mul_sparse_ternary)", t, NTESTS);
+    printf("----------------------------------------------------------\n\n");
+
+
 
     // Forward NTT
     randomize_poly(&test_poly_a);
@@ -314,24 +390,24 @@ int main() {
          return 1;
     }
     // Need valid z (centered) and c for pack_sig test
-    polyvecl z_unpacked;
-    poly c_unpacked;
-    if (unpack_sig(&z_unpacked, &c_unpacked, sig, siglen) != 0) {
-        fprintf(stderr, "Error: unpack_sig failed during benchmark setup.\n");
+    //polyvecl z_unpacked;
+
+    if (unpack_sig(&z0, &z_rest, &c_unpacked, sig, siglen) != 0) {
+        printf("unpack_sig failed\n");
         return 1;
     }
 
     // Pack Signature
     for (i = 0; i < NTESTS; ++i) {
         t[i] = cpucycles();
-        pack_sig(sig, &z_unpacked, &c_unpacked);
+        pack_sig(sig, &z0, &z_rest, &c_unpacked);
     }
     print_results("pack_sig", t, NTESTS);
 
     // Unpack Signature
     for (i = 0; i < NTESTS; ++i) {
         t[i] = cpucycles();
-        unpack_sig(&z, &c, sig, siglen); // Unpack into different vars if needed
+        unpack_sig(&z0, &z_rest, &c, sig, siglen);// Unpack into different vars if needed
     }
     print_results("unpack_sig", t, NTESTS);
 
@@ -382,15 +458,22 @@ int main() {
     
     polyveck w_recomputed; 
 
-    if (unpack_sig(&z_unpacked, &c_unpacked, sig, siglen) != 0) {
-        fprintf(stderr, "Error: unpack_sig failed while preparing inputs for calculate_A_vec_prod_crt benchmark.\n");
+if (unpack_sig(&z0_unpacked, &z_rest_unpacked, &c_unpacked, sig, siglen) != 0) {
+        fprintf(stderr, "Error: unpack_sig failed...\n");
         return 1;
+    }
+
+    /* Reconstruct z from z0 and z_rest */
+    polyvecl z_legacy_reconstructed;
+    z_legacy_reconstructed.vec[0] = z0_unpacked;
+    for(int k=0; k < D_REST; ++k) {
+        z_legacy_reconstructed.vec[k+1] = z_rest_unpacked.vec[k];
     }
 
     for (i = 0; i < NTESTS; ++i) {
         t[i] = cpucycles();
         
-        calculate_A_vec_prod_crt(&w_recomputed, Agen, &Col0, &z_unpacked);
+        calculate_A_vec_prod_crt(&w_recomputed, Agen, &Col0, &z_legacy_reconstructed);
     }
     print_results("calculate_A_vec_prod_crt", t, NTESTS);
     printf("\n--------------------------------------------------\n");

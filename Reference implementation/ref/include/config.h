@@ -1,6 +1,6 @@
 #ifndef CONFIG_H
 #define CONFIG_H
-
+// #define ccc_USE_AES
 #if ccc_MODE == 2
 #define CRYPTO_ALGNAME "ccc2"
 #define ccc_NAMESPACETOP ccc2

@@ -1,4 +1,4 @@
-#ifndef CCC_POLYVEC_H // Changed guard name
+#ifndef CCC_POLYVEC_H 
 #define CCC_POLYVEC_H
 
 #include "params.h"
@@ -9,6 +9,14 @@
 typedef struct {
     poly vec[K];
 } polyveck;
+typedef struct {
+    poly vec[D]; /* Size is exactly K+L */
+} polyvecd;
+
+/* Vector for the remaining part (y_rest, z_rest) */
+typedef struct {
+    poly vec[D_REST]; /* Size is exactly K+L-1 */
+} polyvecd_rest;
 
 #define polyveck_add ccc_NAMESPACE(polyveck_add)
 void polyveck_add(polyveck *w, const polyveck *u, const polyveck *v);
@@ -32,7 +40,7 @@ void polyveck_ntt(polyveck *x);
 #define polyveck_invntt_tomont ccc_NAMESPACE(polyveck_invntt_tomont)
 void polyveck_invntt_tomont(polyveck *x);
 
-#define polyveck_pointwise_montgomery ccc_NAMESPACE(polyveck_pointwise_montgomery) // Renamed from polyveck_poly_pointwise_montgomery for consistency
+#define polyveck_pointwise_montgomery ccc_NAMESPACE(polyveck_pointwise_montgomery) 
 void polyveck_pointwise_montgomery(polyveck *w, const polyveck *u, const poly *v);
 
 #define polyveck_reduce ccc_NAMESPACE(polyveck_reduce)
@@ -44,7 +52,7 @@ void polyveck_mod_2q(polyveck *v); // Apply non-negative reduce mod 2q (same as 
 #define polyveck_negate ccc_NAMESPACE(polyveck_negate) // Added declaration
 void polyveck_negate(polyveck *neg_v, const polyveck *v); // Negate coefficients
 
-/* Vectors of polynomials of length L+K */ // **** UPDATED dimension ****
+/* Vectors of polynomials of length L+K */
 typedef struct {
     poly vec[L+K];
 } polyvecl;

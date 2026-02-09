@@ -23,11 +23,9 @@ size_t pack_sk(uint8_t *sk, const uint8_t *pk, size_t pklen, const polyvecm *s_g
 int unpack_sk(uint8_t *pk, size_t *pklen, polyvecm *s_gen, polyveck *e_gen, polyvecl *s_prime, poly *s_bar_prime_0, uint8_t key[SEEDBYTES], const uint8_t *sk, size_t sklen);
 // Signature Packing/Unpacking
 #define pack_sig ccc_NAMESPACE(pack_sig)
-
-size_t pack_sig(uint8_t sig[CRYPTO_BYTES], const polyvecl *z, const poly *c);
-
+size_t pack_sig(uint8_t sig[CRYPTO_BYTES], const poly *z0, const polyvecd_rest *z_rest, const poly *c);
 #define unpack_sig ccc_NAMESPACE(unpack_sig)
-int unpack_sig(polyvecl *z, poly *c, const uint8_t *sig, size_t siglen);
+int unpack_sig(poly *z0, polyvecd_rest *z_rest, poly *c, const uint8_t *sig, size_t siglen);
 
 
 

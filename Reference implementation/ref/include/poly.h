@@ -5,6 +5,7 @@
 #include "reduce.h"
 #include <stddef.h>
 #include <stdint.h>
+#include "symmetric.h"
 #include "config.h" // For ccc_NAMESPACE
 
 typedef struct {
@@ -80,5 +81,7 @@ void poly_mod_2(poly *r, const poly *a);
 #define poly_crt_reconstruct_centered_mod_2Q ccc_NAMESPACE(poly_crt_reconstruct_centered_mod_2Q)
 void poly_crt_reconstruct_centered_mod_2Q(poly *res_2Q, const poly *res_2, const poly *res_Q_frozen);
 
-
+int poly_check_norm_inf(const poly *a, int32_t bound);
+void poly_mul_sparse_ternary(poly *res, const poly *s, const poly *c, const poly *x);
+void poly_uniform_preinit(poly *a, stream128_state *state);
 #endif // CCC_POLY_H

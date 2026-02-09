@@ -1,4 +1,4 @@
-#include "params.h" // Include params first
+#include "params.h" 
 #include "poly.h"
 #include "ntt.h"
 #include "reduce.h"
@@ -45,19 +45,58 @@ void poly_sub(poly *c, const poly *a, const poly *b) {
 }
 
 /*************************************************
- * Name:        poly_pointwise_montgomery
- * Description: Pointwise multiplication in NTT domain (Montgomery form).
- * Assumes inputs a, b are in Montgomery form. Output c is too.
- **************************************************/
+* Name:        poly_pointwise_montgomery
+*
+* Description: Pointwise multiplication in NTT domain (Montgomery form).
+* Computes c = a * b * R^-1 mod q.
+*
+* Arguments:   - poly *c: pointer to output polynomial
+* - const poly *a: pointer to first operand
+* - const poly *b: pointer to second operand
+**************************************************/
 void poly_pointwise_montgomery(poly *c, const poly *a, const poly *b) {
     // for (unsigned int i = 0; i < N; ++i)
     //     //c->coeffs[i] = (int32_t)product;
     
     // // Result is in [-Q+1, Q-1]
     unsigned int i;
-    for(i=0;i<N/4;i++) {
-      basemul(&c->coeffs[4*i], &a->coeffs[4*i], &b->coeffs[4*i], zetas[64+i]);
-      basemul(&c->coeffs[4*i+2], &a->coeffs[4*i+2], &b->coeffs[4*i+2], -zetas[64+i]);
+    for(i = 0; i < N/4; i++) {
+        int16_t zeta = zetas[64+i];
+        int16_t minus_zeta = -zeta;
+
+        /* Process first pair (indices 4*i, 4*i+1) */
+        int16_t a0 = a->coeffs[4*i];
+        int16_t a1 = a->coeffs[4*i+1];
+        int16_t b0 = b->coeffs[4*i];
+        int16_t b1 = b->coeffs[4*i+1];
+
+        // Compute r0 = a0*b0 + a1*b1*zeta
+        // The result of a0*b0 is an int32, and immediate reduction is not necessary.
+        // a1*b1*zeta will exceed the range of int32, so t = a1*b1 must be reduced first.
+        int32_t t = montgomery_reduce((int64_t)a1 * b1); 
+        int32_t r0_acc = (int32_t)a0 * b0 + (int32_t)t * zeta;
+        
+        //  Compute r1 = a0*b1 + a1*b0
+        // Optimization: The two products are added directly, without the need for intermediate reduction.
+        int32_t r1_acc = (int32_t)a0 * b1 + (int32_t)a1 * b0;
+
+        c->coeffs[4*i]   = (int16_t)montgomery_reduce(r0_acc);
+        c->coeffs[4*i+1] = (int16_t)montgomery_reduce(r1_acc);
+
+        //  Process second pair (indices 4*i+2, 4*i+3) 
+        //  Logic is same, but using minus_zeta 
+        a0 = a->coeffs[4*i+2];
+        a1 = a->coeffs[4*i+3];
+        b0 = b->coeffs[4*i+2];
+        b1 = b->coeffs[4*i+3];
+
+        t = montgomery_reduce((int64_t)a1 * b1);
+        r0_acc = (int32_t)a0 * b0 + (int32_t)t * minus_zeta;
+        
+        r1_acc = (int32_t)a0 * b1 + (int32_t)a1 * b0;
+
+        c->coeffs[4*i+2] = (int16_t)montgomery_reduce(r0_acc);
+        c->coeffs[4*i+3] = (int16_t)montgomery_reduce(r1_acc);
     }
 }
 
@@ -71,7 +110,7 @@ void poly_pointwise_montgomery(poly *c, const poly *a, const poly *b) {
 **************************************************/
 void poly_reduce2q(poly *a) {
     for (unsigned int i = 0; i < N; ++i)
-        a->coeffs[i] = reduce32_2q(a->coeffs[i]); // Macro points to centered version
+        a->coeffs[i] = reduce32_2q(a->coeffs[i]); /* Uses centered reduction */
 }
 
 /*************************************************
@@ -84,7 +123,7 @@ void poly_reduce2q(poly *a) {
 **************************************************/
 void poly_freeze2q(poly *a) {
     for (unsigned int i = 0; i < N; ++i)
-        a->coeffs[i] = freeze2q(a->coeffs[i]); // Macro points to non-negative version
+        a->coeffs[i] = freeze2q(a->coeffs[i]); /* Uses non-negative reduction */
 }
 
 /*************************************************
@@ -114,7 +153,7 @@ void poly_freeze(poly *a) {
     poly_reduce(a);
 }
 
-// Define buffer size calculation based on N and rate (adjust if needed)
+/* Define buffer size calculation based on N and rate */
 #define POLY_UNIFORM_NBLOCKS (((N * 16 / 8) + STREAM128_BLOCKBYTES - 1) / STREAM128_BLOCKBYTES + 1) // Estimate based on 16 bits per coeff needed for rej_uniform
 #define POLY_UNIFORM_BUF_SIZE (POLY_UNIFORM_NBLOCKS * STREAM128_BLOCKBYTES + 2) // +2 for safety margin for rej_uniform read
 /*************************************************
@@ -130,47 +169,59 @@ void poly_freeze(poly *a) {
 * - uint16_t nonce: 16-bit nonce
 **************************************************/
 void poly_uniform(poly *a, const uint8_t seed[SEEDBYTES], uint16_t nonce) {
+    stream128_state state;
+    stream128_init(&state, seed, nonce);
+    poly_uniform_preinit(a, &state);
+    stream128_free(&state);
+}
+
+
+
+/*************************************************
+* Name:        poly_uniform_preinit
+*
+* Description: Core sampling logic for poly_uniform.
+* Samples a polynomial with uniformly random coefficients
+* using an already initialized XOF/PRNG state.
+*
+* Arguments:   - poly *a: pointer to output polynomial
+* - stream128_state *state: pointer to initialized stream state
+**************************************************/
+void poly_uniform_preinit(poly *a, stream128_state *state) {
     unsigned int ctr = 0;
     unsigned int pos = 0;
     unsigned int buflen = 0;
     uint8_t buf[POLY_UNIFORM_BUF_SIZE];
-    stream128_state state;
-
-    stream128_init(&state, seed, nonce);
-
+    
     while (ctr < N) {
         unsigned int bytes_available = buflen - pos;
-        // Need 2 bytes for rej_uniform
         if (bytes_available < 2) {
-            // Move remaining bytes (0 or 1) to the beginning
              if (bytes_available > 0) {
                  memmove(buf, buf + pos, bytes_available);
             }
             buflen = bytes_available;
             pos = 0;
 
-            // Squeeze more blocks
             unsigned int nblocks_to_squeeze = POLY_UNIFORM_NBLOCKS;
             if (buflen + nblocks_to_squeeze * STREAM128_BLOCKBYTES > POLY_UNIFORM_BUF_SIZE) {
-                // Adjust if buffer would overflow (shouldn't happen with calculation above)
                 nblocks_to_squeeze = (POLY_UNIFORM_BUF_SIZE - buflen) / STREAM128_BLOCKBYTES;
             }
 
             if (nblocks_to_squeeze > 0) {
-                 stream128_squeezeblocks(buf + buflen, nblocks_to_squeeze, &state);
+                 stream128_squeezeblocks(buf + buflen, nblocks_to_squeeze, state);
                  buflen += nblocks_to_squeeze * STREAM128_BLOCKBYTES;
             } else if (buflen < 2) {
-                // Error: Cannot get enough bytes
                 fprintf(stderr, "Error: poly_uniform cannot squeeze enough bytes.\n");
-                poly_zero(a); // Zero out polynomial on error
+                poly_zero(a);
                 return;
             }
         }
-
-        // Call rej_uniform (expects buffer, buffer length, pointer to position)
         ctr += rej_uniform(a->coeffs + ctr, N - ctr, buf, buflen, &pos);
     }
 }
+
+
+
 
 /*************************************************
 * Name:        poly_ntt
@@ -276,7 +327,6 @@ void poly_mul(poly *c, const poly *a, const poly *b) {
     }
 
     // Final reduction mod 2q (centered)
-    // Final reduction mod 2q (centered) - CORRECTED VERSION
     for (i = 0; i < N; ++i) {
         int64_t val = res[i]; 
 
@@ -556,4 +606,95 @@ void poly_crt_reconstruct_centered_mod_2Q(poly *res_2Q, const poly *res_2, const
 }
 
 
+/*************************************************
+* Name:        poly_check_norm_inf
+*
+* Description: Checks if the infinity norm of a polynomial exceeds a bound.
+* Assumes coefficients are standard integers (possibly negative).
+*
+* Arguments:   - const poly *a: pointer to input polynomial
+* - int32_t bound: the norm bound
+*
+* Returns:     1 if norm > bound (fail), 0 otherwise (pass).
+**************************************************/
+int poly_check_norm_inf(const poly *a, int32_t bound) {
+    for (int i = 0; i < N; ++i) {
+        if (abs(a->coeffs[i]) > bound) { 
+            return 1; 
+        }
+    }
+    return 0; 
+}
+
+
+
+/*************************************************
+* Name:        poly_mul_acc
+*
+* Description: Pointwise multiplication and accumulation in NTT domain.
+* Computes r = r + a * b.
+*
+* Arguments:   - poly *r: pointer to input/output accumulator polynomial
+* - const poly *a: pointer to first operand
+* - const poly *b: pointer to second operand
+**************************************************/
+void poly_mul_acc(poly *r, const poly *a, const poly *b) {
+    poly t;
+    poly_pointwise_montgomery(&t, a, b);
+    poly_add(r, r, &t);
+}
+
+
+/*************************************************
+* Name:        poly_mul_sparse_ternary
+*
+* Description: Efficiently computes res = s * (c + x) exploiting the sparsity 
+* and ternary nature of (c + x).
+*
+* Arguments:   - poly *res: pointer to output polynomial
+* - const poly *s: pointer to secret polynomial
+* - const poly *c: pointer to challenge polynomial
+* - const poly *x: pointer to auxiliary polynomial
+**************************************************/
+void poly_mul_sparse_ternary(poly *res, const poly *s, const poly *c, const poly *x) {
+    int16_t idx[N];  
+    int8_t  val[N];  
+    int cnt = 0;
+    
+    /* Pre-computation: Identify non-zero indices of (c+x) */
+    for(int i=0; i<N; i++) {
+        int32_t sum = c->coeffs[i] + x->coeffs[i];
+        if (sum != 0) {
+            idx[cnt] = (int16_t)i;
+            val[cnt] = (int8_t)sum; 
+            cnt++;
+        }
+    }
+    
+    memset(res->coeffs, 0, sizeof(res->coeffs));
+    
+    /* Sparse multiplication */
+    for(int j=0; j<cnt; j++) {
+        int pos = idx[j];
+        int8_t v = val[j]; 
+        
+        int k_limit = N - pos;
+        
+        if (v == 1) {
+            for (int k = 0; k < k_limit; k++) {
+                res->coeffs[k + pos] += s->coeffs[k];
+            }
+            for (int k = k_limit; k < N; k++) {
+                res->coeffs[k + pos - N] -= s->coeffs[k];
+            }
+        } else { /* v == -1 */
+            for (int k = 0; k < k_limit; k++) {
+                res->coeffs[k + pos] -= s->coeffs[k];
+            }
+            for (int k = k_limit; k < N; k++) {
+                res->coeffs[k + pos - N] += s->coeffs[k];
+            }
+        }
+    }
+}
 

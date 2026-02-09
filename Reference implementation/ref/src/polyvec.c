@@ -476,6 +476,28 @@ void polyvecl_invntt_tomont(polyvecl *v) {
     }
 }
 
+/*************************************************
+* Name:        fast_reconstruct_2q
+*
+* Description: Reconstructs a value modulo 2q from its CRT components.
+* Combines value r (mod q) and u (mod 2).
+*
+* Arguments:   - int16_t r: value modulo q
+* - int32_t u: value modulo 2
+*
+* Returns:     Reconstructed value centered modulo 2q.
+**************************************************/
+static int32_t fast_reconstruct_2q(int16_t r, int32_t u) {
+    int32_t res = 2 * (int32_t)r; 
+    if (u & 1) {
+        res += Q;
+    }
+    /* Reduce to [0, 2Q-1] */
+    if (res >= DQ) res -= DQ;
+    /* Center to (-Q, Q] */
+    if (res > Q) res -= DQ;
+    return res;
+}
 
 /*************************************************
 * Name:        calculate_A_vec_prod_crt
@@ -492,47 +514,46 @@ void polyvecl_invntt_tomont(polyvecl *v) {
 void calculate_A_vec_prod_crt(polyveck *w, const polyvecm Agen_ntt[K], const polyveck *Col0_ntt, const polyvecl *v)
 {
     polyvecl v_ntt;
-    polyveck w_mod_q, w_mod_2;
-    poly temp_prod_ntt;
+    polyveck w_mod_q; 
+    poly w_mod_2_part;
+    poly temp;
 
-    
+    /* 1. Transform to NTT domain */
     for(int i=0; i < L+K; ++i) {
         v_ntt.vec[i] = v->vec[i];
-        //poly_reduce(&v_ntt.vec[i]);
         poly_ntt(&v_ntt.vec[i]);
     }
 
+    /* 2. Compute A' * v in NTT domain */
+    /* Input Col0_ntt is -b, Agen_ntt is Agen */
+    /* Result w_mod_q corresponds to r = A'v */
     for (int i = 0; i < K; ++i) {
+        /* First column: (-b) * z0 */
         poly_pointwise_montgomery(&w_mod_q.vec[i], &Col0_ntt->vec[i], &v_ntt.vec[0]);
         
+        /* Middle columns: Agen * z_rest */
         for (int j = 0; j < M; ++j) {
-            poly Agen_doubled_ntt;
-            for(int l=0; l<N; ++l) {
-                Agen_doubled_ntt.coeffs[l] = fqmul(Agen_ntt[i].vec[j].coeffs[l], mont_two);
-            }
-            poly_pointwise_montgomery(&temp_prod_ntt, &Agen_doubled_ntt, &v_ntt.vec[j + 1]);
-            poly_add(&w_mod_q.vec[i], &w_mod_q.vec[i], &temp_prod_ntt);
+            poly_pointwise_montgomery(&temp, &Agen_ntt[i].vec[j], &v_ntt.vec[j + 1]);
+            poly_add(&w_mod_q.vec[i], &w_mod_q.vec[i], &temp);
         }
 
-        poly v_doubled_ntt;
-        for(int l=0; l<N; ++l) {
-            v_doubled_ntt.coeffs[l] = fqmul(v_ntt.vec[L+i].coeffs[l], mont_two);
-        }
-        poly_add(&w_mod_q.vec[i], &w_mod_q.vec[i], &v_doubled_ntt);
+        /* Last column: Identity * z_last */
+        poly_add(&w_mod_q.vec[i], &w_mod_q.vec[i], &v_ntt.vec[L+i]);
 
+        /* Convert back to normal domain */
         poly_invntt_tomont(&w_mod_q.vec[i]);
+        poly_freeze(&w_mod_q.vec[i]); 
     }
     
-    
-    poly v0_mod_2;
-    poly_mod_2(&v0_mod_2, &v->vec[0]);
-    w_mod_2.vec[0] = v0_mod_2;
-    for (int i = 1; i < K; ++i) {
-        poly_zero(&w_mod_2.vec[i]);
-    }
+    /* 3. Compute mod 2 channel (u = z0 mod 2) */
+    poly_mod_2(&w_mod_2_part, &v->vec[0]);
 
-    
+    /* 4. CRT Reconstruction (2r + qu) */
     for (int i = 0; i < K; ++i) {
-        poly_crt_reconstruct_centered_mod_2Q(&w->vec[i], &w_mod_2.vec[i], &w_mod_q.vec[i]);
+        for(int k = 0; k < N; ++k) {
+            int16_t r = w_mod_q.vec[i].coeffs[k];
+            int32_t u = (i == 0) ? w_mod_2_part.coeffs[k] : 0;
+            w->vec[i].coeffs[k] = fast_reconstruct_2q(r, u);
+        }
     }
 }

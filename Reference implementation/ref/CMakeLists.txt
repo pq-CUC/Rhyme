@@ -20,7 +20,7 @@ set(ccc_SRCS
   src/sampler.c
   src/packing.c
   src/sign.c
-
+  src/aes256ctr.c
 )
 
 set(ccc_FIPS202_SRCS

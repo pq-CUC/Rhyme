@@ -8,6 +8,25 @@
 #include <stdio.h>
 #include "encoding.h" 
 
+
+/*************************************************
+* Name:        center_for_packing
+*
+* Description: Centers a value modulo Q to the range [-(Q-1)/2, (Q-1)/2].
+* Used before packing to ensure correct sign representation.
+*
+* Arguments:   - int32_t v: input value
+*
+* Returns:     Centered value.
+**************************************************/
+static int32_t center_for_packing(int32_t v) {
+    v = v % Q;
+    if (v < 0) v += Q;
+    if (v > Q / 2) { 
+        v -= Q;      
+    }
+    return v;
+}
 /*************************************************
 * Name:        pack_pk
 *
@@ -23,16 +42,16 @@
 size_t pack_pk(uint8_t *pk, const uint8_t seedA[SEEDBYTES], const polyveck *b) {
     uint8_t *pk_ptr = pk;
     
-    // 1. Copy seedA
+    // Copy seedA
     memcpy(pk_ptr, seedA, SEEDBYTES);
     pk_ptr += SEEDBYTES;
 
-    // 2. Prepare pointers for fixed-size main data and temporary overflow buffer
+    //  Prepare pointers for fixed-size main data and temporary overflow buffer
     uint8_t *main_buf_ptr = pk_ptr;
     uint8_t overflow_buf[(K * N + 7) / 8] = {0};
     int total_overflow_bits = 0;
 
-    // 3. Process all polynomials into a fixed-size main area and a variable overflow area
+    //  Process all polynomials into a fixed-size main area and a variable overflow area
     for (int i = 0; i < K; ++i) {
         const poly *p = &b->vec[i];
         for (int j = 0; j < N; ++j) {
@@ -49,15 +68,15 @@ size_t pack_pk(uint8_t *pk, const uint8_t seedA[SEEDBYTES], const polyveck *b) {
         }
     }
 
-    // 4. Advance pointer past the fixed-size main data area
+    //  Advance pointer past the fixed-size main data area
     pk_ptr += K * N;
 
-    // 5. Append the overflow data
+    //  Append the overflow data
     size_t overflow_byte_len = (total_overflow_bits + 7) / 8;
     memcpy(pk_ptr, overflow_buf, overflow_byte_len);
     pk_ptr += overflow_byte_len;
 
-    // 6. Return the total actual size
+    //  Return the total actual size
     return (size_t)(pk_ptr - pk);
 }
 
@@ -129,8 +148,8 @@ int unpack_pk(uint8_t seedA[SEEDBYTES], polyveck *b, const uint8_t *pk, size_t p
 **************************************************/
 size_t pack_sk(uint8_t *sk, const uint8_t *pk, size_t pklen, const polyvecm *s_gen, const polyveck *e_gen, const polyvecl *s_prime, const poly *s_bar_prime_0, const uint8_t key[SEEDBYTES]) {
     uint8_t *sk_ptr = sk;
-    const size_t sgen_bytes = M * POLYSIGMA1_PACKEDBYTES;
-    const size_t egen_bytes = K * POLYSIGMA1_PACKEDBYTES;
+    const size_t sgen_bytes = M * SK_POLY_PACKEDBYTES;
+    const size_t egen_bytes = K * SK_POLY_PACKEDBYTES;
     const size_t sprime_bytes = S_PRIME_PACKEDBYTES;
     const size_t s_bar_prime_bytes = S_BAR_PRIME_0_PACKEDBYTES; 
 
@@ -140,6 +159,8 @@ size_t pack_sk(uint8_t *sk, const uint8_t *pk, size_t pklen, const polyvecm *s_g
     sk_ptr += sgen_bytes;
     pack_polyveck_sigma1(sk_ptr, e_gen);
     sk_ptr += egen_bytes;
+
+
     pack_polyvecl_s_prime(sk_ptr, s_prime); 
     sk_ptr += sprime_bytes;
     {
@@ -157,9 +178,9 @@ size_t pack_sk(uint8_t *sk, const uint8_t *pk, size_t pklen, const polyvecm *s_g
                 bit = 0;
             }
         }
-        if (bit > 0 && idx < s_bar_prime_bytes) {
-            sk_ptr[idx] = byte;
-        }
+            if (bit > 0 && idx < s_bar_prime_bytes) {
+                sk_ptr[idx] = byte;
+            }
     }
 
     sk_ptr += s_bar_prime_bytes;
@@ -180,7 +201,6 @@ int unpack_sk(uint8_t *pk, size_t *pklen, polyvecm *s_gen, polyveck *e_gen, poly
     const size_t sprime_bytes = S_PRIME_PACKEDBYTES; 
     const size_t s_bar_prime_bytes = S_BAR_PRIME_0_PACKEDBYTES;
 
-    // --- Start of modification ---
     // Deduce the length of the embedded public key
     if (sklen < SEEDBYTES + (size_t)K * N) return -1; // Not enough data for even a minimal PK
     
@@ -198,13 +218,14 @@ int unpack_sk(uint8_t *pk, size_t *pklen, polyvecm *s_gen, polyveck *e_gen, poly
     *pklen = embedded_pklen;
     memcpy(pk, sk_ptr, *pklen);
     sk_ptr += *pklen;
-    // --- End of modification ---
 
     if ((size_t)(sk_ptr - sk) + sgen_bytes + egen_bytes + sprime_bytes + SEEDBYTES > sklen) return -1;
     unpack_polyvecm_sigma1(s_gen, sk_ptr);
     sk_ptr += sgen_bytes;
     unpack_polyveck_sigma1(e_gen, sk_ptr);
     sk_ptr += egen_bytes;
+
+
     unpack_polyvecl_s_prime(s_prime, sk_ptr); 
     sk_ptr += sprime_bytes;
     if ((size_t)(sk_ptr - sk) + s_bar_prime_bytes > sklen) return -1;
@@ -244,44 +265,49 @@ int unpack_sk(uint8_t *pk, size_t *pklen, polyvecm *s_gen, polyveck *e_gen, poly
 *
 * Returns:     The total number of bytes written to sig, or 0 on failure.
 **************************************************/
-size_t pack_sig(uint8_t sig[CRYPTO_BYTES], const polyvecl *z, const poly *c) {
+size_t pack_sig(uint8_t sig[CRYPTO_BYTES], const poly *z0, const polyvecd_rest *z_rest, const poly *c) {
     uint8_t *sig_ptr = sig;
     uint16_t size_encoded_z;
 
-    // Encode z first into the buffer starting after the size field
-    size_encoded_z = encode_z(sig_ptr + CCC_RANS_SIZE_BYTES, z);
+    /* Combine z0 and z_rest into a single vector for rANS encoding */
+    polyvecl z_combined;
+    
+    /* Center coefficients for z0 */
+    for(int j=0; j<N; ++j) {
+        z_combined.vec[0].coeffs[j] = center_for_packing(z0->coeffs[j]);
+    }
+    
+    /* Center coefficients for z_rest */
+    for(int i = 0; i < D_REST; ++i) {
+        for(int j=0; j<N; ++j) {
+            z_combined.vec[i+1].coeffs[j] = center_for_packing(z_rest->vec[i].coeffs[j]);
+        }
+    }
+
+    /* Perform rANS encoding */
+    size_encoded_z = encode_z(sig_ptr + CCC_RANS_SIZE_BYTES, &z_combined);
     if (size_encoded_z == 0) {
         fprintf(stderr, "[MODE %d] Error: encode_z failed in pack_sig.\n", ccc_MODE);
-        return 0; // Return 0 to indicate error
+        return 0; 
     }
 
-    // Calculate total space needed
+    /* Compute size and write */
     size_t total_needed = CCC_RANS_SIZE_BYTES + size_encoded_z + POLYC_PACKEDBYTES;
-
-    // Check if the required space exceeds the allocated buffer size
     if (total_needed > CRYPTO_BYTES) {
-        fprintf(stderr, "[MODE %d] Error: Packed sig size needed (%zu) > CRYPTO_BYTES (%d). z_size=%u\n",
-                ccc_MODE, total_needed, CRYPTO_BYTES, size_encoded_z);
-        return 0; // Return 0 to indicate error
+        return 0; 
     }
 
-    // Write the size of encoded z (2 bytes)
     sig_ptr[0] = (uint8_t)(size_encoded_z & 0xFF);
     sig_ptr[1] = (uint8_t)((size_encoded_z >> 8) & 0xFF);
     sig_ptr += CCC_RANS_SIZE_BYTES;
-
-    // Advance pointer past the encoded z data (already written by encode_z)
     sig_ptr += size_encoded_z;
 
-    // Pack the challenge c
+    /*  Pack challenge c */
     pack_poly_challenge(sig_ptr, c);
-    sig_ptr += POLYC_PACKEDBYTES;
-    // Calculate the final packed length
-    size_t packed_len = (size_t)(sig_ptr - sig);
-
-    return packed_len; // Return the actual packed length
+    
+    return (size_t)(sig_ptr + POLYC_PACKEDBYTES - sig);
 }
-// **** END MODIFIED pack_sig ****
+
 
 
 /*************************************************
@@ -296,54 +322,54 @@ size_t pack_sig(uint8_t sig[CRYPTO_BYTES], const polyvecl *z, const poly *c) {
 *
 * Returns:     0 on success, non-zero on failure.
 **************************************************/
-int unpack_sig(polyvecl *z, poly *c, const uint8_t *sig, size_t siglen) {
+int unpack_sig(poly *z0, polyvecd_rest *z_rest, poly *c, const uint8_t *sig, size_t siglen) {
     const uint8_t *sig_ptr = sig;
     uint16_t size_encoded_z;
     size_t min_required_len = CCC_RANS_SIZE_BYTES + POLYC_PACKEDBYTES;
 
-    // Check if siglen is at least minimum possible length
-    if (siglen < min_required_len) return -1; // Signature too short
+    if (siglen < min_required_len) return -1;
 
-    // Read the size of the encoded z component
+    /*  Read compressed data length */
     size_encoded_z = (uint16_t)sig_ptr[0] | ((uint16_t)sig_ptr[1] << 8);
     sig_ptr += CCC_RANS_SIZE_BYTES;
 
-    // Check if the claimed total length makes sense
+    /* Verify length */
     size_t expected_total_len = CCC_RANS_SIZE_BYTES + size_encoded_z + POLYC_PACKEDBYTES;
-    if (siglen < expected_total_len) return -2; // siglen is shorter than implied by encoded_z size
-    // Optional: Check if expected_total_len exceeds max buffer size if needed elsewhere,
-    // but here we only care about decoding what's given in siglen.
-    // Check if there's enough data left for the claimed size_encoded_z
-    if ((size_t)(sig_ptr - sig) + size_encoded_z > siglen) return -2; // Not enough data for z
-
-    // Decode z
-    int decode_status = decode_z(z, sig_ptr, size_encoded_z);
-    if (decode_status != 0) return -3; // rANS decoding failed
+    if (siglen < expected_total_len) {
+    fprintf(stderr, "Buffer too small: siglen %zu < expected %zu\n", siglen, expected_total_len);
+    return -2;
+}
+    
+    /* Decode into a temporary combined vector */
+    polyvecl z_combined;
+    int decode_status = decode_z(&z_combined, sig_ptr, size_encoded_z);
+    if (decode_status != 0) return -3; 
+    
     sig_ptr += size_encoded_z;
 
-    // Check if there's enough data left for the challenge c
-    if ((size_t)(sig_ptr - sig) + POLYC_PACKEDBYTES > siglen) return -2; // Not enough data for c
-
-    // Unpack the challenge c
-    unpack_poly_challenge(c, sig_ptr);
-    sig_ptr += POLYC_PACKEDBYTES;
-
-    // Check if we consumed exactly siglen bytes (no trailing non-zero bytes expected if sender used correct length)
-    // Note: Trailing zero bytes might exist if sender padded, but shouldn't affect verification.
-    // We've already checked siglen >= expected_total_len. If siglen > expected_total_len,
-    // it implies trailing padding, which we can ignore or optionally check for zeros.
-    if ((size_t)(sig_ptr - sig) != expected_total_len) {
-       // This case might occur if siglen provided was larger than necessary.
-       // We successfully decoded based on the internal length field.
-       // Let's not treat this as an error, but maybe issue a warning if needed.
-       // fprintf(stderr, "Warning: unpack_sig consumed %zu bytes, but siglen was %zu\n", (size_t)(sig_ptr - sig), siglen);
+    /* Distribute decoded data to z0 and z_rest, correcting centered values */
+    /* Process z0 */
+    for(int j=0; j<N; ++j) {
+        int32_t val = z_combined.vec[0].coeffs[j];
+        if (val > Q/2) {
+            val -= Q;
+        }
+        z0->coeffs[j] = val;
     }
-     // Optional check for non-zero trailing bytes if strict conformance is required:
-     for (size_t i = (size_t)(sig_ptr - sig); i < siglen; ++i) {
-         if (sig[i] != 0) { return -4; /* Trailing non-zero bytes */ }
-     }
-
-    return 0; // Success
+    
+    /* Process z_rest */
+    for(int i = 0; i < D_REST; ++i) {
+        for(int j=0; j<N; ++j) {
+            int32_t val = z_combined.vec[i+1].coeffs[j];
+            if (val > Q/2) {
+                val -= Q;
+            }
+            z_rest->vec[i].coeffs[j] = val;
+        }
+    }
+    unpack_poly_challenge(c, sig_ptr);
+    
+    return 0;
 }
 
 /*************************************************

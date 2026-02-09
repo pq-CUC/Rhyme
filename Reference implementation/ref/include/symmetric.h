@@ -4,6 +4,7 @@
 #include "params.h"
 #include <stdint.h>
 #include "fips202.h"
+#include "aes256ctr.h" 
 
 // Cryptographic XOF function: shake256
 typedef keccak_state xof256_state;
@@ -26,9 +27,7 @@ void ccc_shake256_absorb_twice(keccak_state *state, const uint8_t *in1,
 
 
 // Stream function: aes256 or shake128|256
-#ifdef ccc_USE_AES // stream: aes256
-
-#include "aes256ctr.h"
+#ifdef ccc_USE_AES 
 
 typedef aes256ctr_ctx stream128_state;
 typedef aes256ctr_ctx stream256_state;
@@ -45,34 +44,40 @@ typedef aes256ctr_ctx stream256_state;
 #define stream256_squeezeblocks(OUT, OUTBLOCKS, STATE) \
         aes256ctr_squeezeblocks(OUT, OUTBLOCKS, STATE)
 
-#else // stream: shake128 and shake256
+#else 
 
-typedef keccak_state stream128_state;
+/* ---------------------------------------------------------
+   Hybrid Mode: AES for Matrix Generation, SHAKE for others
+   --------------------------------------------------------- */
+
+/* 1. stream128 (For Agen) -> Forced to AES */
+typedef aes256ctr_ctx stream128_state;
+#define STREAM128_BLOCKBYTES AES256CTR_BLOCKBYTES
+
+#define stream128_init(STATE, SEED, NONCE) \
+        aes256ctr_init(STATE, SEED, NONCE)
+
+#define stream128_free(STATE) \
+        aes256ctr_free(STATE)
+
+#define stream128_squeezeblocks(OUT, OUTBLOCKS, STATE) \
+        aes256ctr_squeezeblocks(OUT, OUTBLOCKS, STATE)
+
+/* 2. stream256 (For others) -> SHAKE256 */
 typedef keccak_state stream256_state;
-
-#define ccc_shake128_stream_init                                            \
-    ccc_NAMESPACE(ccc_shake128_stream_init)
-void ccc_shake128_stream_init(keccak_state *state,
-                                 const uint8_t seed[SEEDBYTES], uint16_t nonce);
+#define STREAM256_BLOCKBYTES SHAKE256_RATE
 
 #define ccc_shake256_stream_init                                            \
     ccc_NAMESPACE(ccc_shake256_stream_init)
 void ccc_shake256_stream_init(keccak_state *state,
                                  const uint8_t seed[CRHBYTES], uint16_t nonce);
 
-#define STREAM128_BLOCKBYTES SHAKE128_RATE
-#define STREAM256_BLOCKBYTES SHAKE256_RATE
-
-#define stream128_init(STATE, SEED, NONCE)                                     \
-    ccc_shake128_stream_init(STATE, SEED, NONCE)
-#define stream128_squeezeblocks(OUT, OUTBLOCKS, STATE)                         \
-    shake128_squeezeblocks(OUT, OUTBLOCKS, STATE)
 #define stream256_init(STATE, SEED, NONCE)                                     \
     ccc_shake256_stream_init(STATE, SEED, NONCE)
 #define stream256_squeezeblocks(OUT, OUTBLOCKS, STATE)                         \
     shake256_squeezeblocks(OUT, OUTBLOCKS, STATE)
 
+
 #endif // stream
 
 #endif //SYMMETRIC_H
-

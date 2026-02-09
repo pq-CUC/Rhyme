@@ -1,3 +1,4 @@
+#include "aes256ctr.h"
 #include "polymat.h"
 #include "params.h"
 #include "poly.h"
@@ -25,22 +26,34 @@ void polymatkl_expand(polyvecl mat[K], const uint8_t rho[SEEDBYTES]) {
 }
 
 /*************************************************
- * Name:        polymat_expand
- *
- * Description: Implementation of ExpandA. Generates matrix A with uniformly
- *              random coefficients a_{i,j} by performing rejection
- *              sampling on the output stream of SHAKE128(rho|j|i)
- *              or AES256CTR(rho,j|i).
- *
- * Arguments:   - polyvecm mat[K]: output matrix k \times m
- *              - const uint8_t rho[]: byte array containing seed rho
- **************************************************/
+* Name:        polymatkm_expand
+*
+* Description: Implementation of ExpandA optimized with AES key reuse.
+* Generates matrix A with uniformly random coefficients.
+* Uses pre-initialized AES state to avoid repeated key expansion.
+*
+* Arguments:   - polyvecm mat[K]: output matrix k x m
+* - const uint8_t rho[]: byte array containing seed rho
+**************************************************/
 void polymatkm_expand(polyvecm mat[K], const uint8_t rho[SEEDBYTES]) {
     unsigned int i, j;
+    aes256ctr_ctx state;
 
-    for (i = 0; i < K; ++i)
-        for (j = 0; j < M; ++j)
-            poly_uniform(&mat[i].vec[j], rho, (i << 8) + j);
+    /* Perform key expansion once outside the loop */
+    aes256ctr_init(&state, rho, 0);
+
+    for (i = 0; i < K; ++i) {
+        for (j = 0; j < M; ++j) {
+            /* Reset nonce (low cost) instead of re-initializing key */
+            uint64_t nonce = (uint64_t)((i << 8) | j);
+            aes256ctr_set_nonce(&state, nonce);
+
+            /* Call pre-initialized sampling function */
+            /* stream128_state is typedef'd to aes256ctr_ctx in symmetric.h */
+            poly_uniform_preinit(&mat[i].vec[j], (stream128_state*)&state);
+        }
+    }
+    aes256ctr_free(&state);
 }
 
 /*************************************************

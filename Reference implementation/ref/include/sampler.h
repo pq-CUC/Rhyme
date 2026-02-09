@@ -32,4 +32,8 @@ void SampleChallenge(poly *c, const uint8_t seed[CRHBYTES]);
 unsigned int rej_uniform(int16_t *a, unsigned int len, const uint8_t *buf, unsigned int buflen, unsigned int *pos);
 
 void poly_uniform_ntt(poly *a, const uint8_t seed[SEEDBYTES], uint16_t nonce);
+
+void SampleY0(poly *y, const uint8_t seed[CRHBYTES], uint16_t nonce);
+void SampleY_rest(polyvecd_rest *y_rest, const uint8_t seed[CRHBYTES], uint16_t nonce);
+int Sample_Z(poly *z0, poly *x, const poly *c, const poly *y0, stream256_state *state);
 #endif // CCC_SAMPLER_H

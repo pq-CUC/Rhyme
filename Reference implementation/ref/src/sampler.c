@@ -5,6 +5,8 @@
 #include "polyvec.h"
 #include "poly.h"
 #include "fips202.h"
+#include "aes256ctr.h"
+#include <math.h>
 #include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -18,7 +20,291 @@
 #define STREAM128_BLOCKBYTES SHAKE128_RATE
 #endif
 
+static uint8_t get_random_bit(stream256_state *state, uint8_t *buf, size_t *buf_len, size_t *buf_pos);
+static void get_random_bytes(uint8_t *out, size_t num_bytes, stream256_state *state, uint8_t *buf, size_t *buf_len, size_t *buf_pos);
 
+
+/*************************************************
+* Name:        sample_chi_k
+*
+* Description: Samples a value from the difference of two Hamming weights
+* of k random bits. Used for sampling noise.
+*
+* Arguments:   - int32_t k: the multiplier factor (and number of bits)
+* - stream256_state *state: pointer to PRNG state
+* - uint8_t *buf: pointer to random buffer
+* - size_t *buf_len: pointer to current buffer length
+* - size_t *buf_pos: pointer to current buffer position
+*
+* Returns:     Sampled integer value.
+**************************************************/
+static int32_t sample_chi_k(int32_t k, stream256_state *state, uint8_t *buf, size_t *buf_len, size_t *buf_pos) {
+    uint8_t b1 = get_random_bit(state, buf, buf_len, buf_pos);
+    uint8_t b2 = get_random_bit(state, buf, buf_len, buf_pos);
+    return k * ((int32_t)b1 - (int32_t)b2);
+}
+
+/*************************************************
+* Name:        hw_bytes
+*
+* Description: Computes the Hamming weight (population count) of a byte array.
+*
+* Arguments:   - const uint8_t *buf: pointer to the input buffer
+* - size_t nbytes: number of bytes to count
+*
+* Returns:     Total Hamming weight as int32_t.
+**************************************************/
+static inline int32_t hw_bytes(const uint8_t *buf, size_t nbytes) {
+    int32_t r = 0;
+    size_t i = 0;
+    uint64_t val64;
+
+    // Processes 8 bytes (64 bits) at a time.
+    while (i + 8 <= nbytes) {
+        memcpy(&val64, buf + i, 8);
+        r += __builtin_popcountll(val64);
+        i += 8;
+    }
+
+    while (i < nbytes) {
+        r += __builtin_popcount(buf[i]);
+        i++;
+    }
+    return r;
+}
+
+/*************************************************
+* Name:        SampleY0
+*
+* Description: Samples the first polynomial y0 of the masking vector y.
+* It uses the difference of Hamming weights of two random bit streams.
+*
+* Arguments:   - poly *y: pointer to output polynomial
+* - const uint8_t seed[]: pointer to input seed (CRHBYTES)
+* - uint16_t nonce: nonce for the sampling process
+**************************************************/
+void SampleY0(poly *y, const uint8_t seed[CRHBYTES], uint16_t nonce) {
+
+    const uint8_t *key_part1 = seed;       
+    const uint8_t *key_part2 = seed + 32;  
+
+    const size_t bytes_per_sign = TAU0 / 8;
+    const size_t total_bytes = 2 * bytes_per_sign;
+    const size_t nblocks = total_bytes / 64; 
+
+    uint8_t buf[total_bytes + 64]; 
+    aes256ctr_ctx state;
+
+    // Only one initialization is performed
+    aes256ctr_init(&state, key_part1, 0); 
+
+    for (int i = 0; i < N / 2; ++i) {
+        uint64_t combined_nonce = ((uint64_t)nonce << 16) | (uint16_t)i;
+        uint64_t retry_ctr = 0;
+        int32_t val;
+
+        do {
+            uint64_t final_nonce = combined_nonce ^ (retry_ctr << 48);
+            aes256ctr_set_nonce(&state, final_nonce);
+
+            aes256ctr_squeezeblocks(buf, nblocks, &state);
+
+            int32_t w_pos = hw_bytes(buf, bytes_per_sign);
+            int32_t w_neg = hw_bytes(buf + bytes_per_sign, bytes_per_sign);
+            val = w_pos - w_neg;
+            
+            retry_ctr++;
+        } while (abs(val) > B0 + 1);
+        
+        y->coeffs[i] = val;
+    }
+    aes256ctr_free(&state);
+    aes256ctr_init(&state, key_part2, 0);
+
+    for (int i = N / 2; i < N; ++i) {
+        uint64_t combined_nonce = ((uint64_t)nonce << 16) | (uint16_t)i;
+        uint64_t retry_ctr = 0;
+        int32_t val;
+
+        do {
+            uint64_t final_nonce = combined_nonce ^ (retry_ctr << 48);
+            aes256ctr_set_nonce(&state, final_nonce);
+            
+            aes256ctr_squeezeblocks(buf, nblocks, &state);
+
+            int32_t w_pos = hw_bytes(buf, bytes_per_sign);
+            int32_t w_neg = hw_bytes(buf + bytes_per_sign, bytes_per_sign);
+            val = w_pos - w_neg;
+            
+            retry_ctr++;
+        } while (abs(val) > B0 + 1);
+        
+        y->coeffs[i] = val;
+    }
+    aes256ctr_free(&state);
+}
+/*************************************************
+* Name:        SampleY_rest
+*
+* Description: Samples the remaining part of the masking vector y (y_rest).
+* Each coefficient is sampled from Chi(0, 2).
+*
+* Arguments:   - polyvecd_rest *y_rest: pointer to output polynomial vector
+* - const uint8_t seed[]: pointer to input seed (CRHBYTES)
+* - uint16_t nonce: nonce for the sampling process
+**************************************************/
+void SampleY_rest(polyvecd_rest *y_rest, const uint8_t seed[CRHBYTES], uint16_t nonce) {
+    uint8_t buf[STREAM256_BLOCKBYTES];
+    size_t buf_len = 0;
+    size_t buf_pos = STREAM256_BLOCKBYTES * 8;
+    stream256_state state;
+    stream256_init(&state, seed, nonce);
+
+    for (int i = 0; i < D_REST; ++i) {
+        for (int j = 0; j < N; ++j) {
+             y_rest->vec[i].coeffs[j] = sample_chi_k(2, &state, buf, &buf_len, &buf_pos);
+        }
+    }
+}
+
+/*************************************************
+* Name:        get_random_double
+*
+* Description: Generates a random double in [0, 1) using 32 random bits.
+* Optimized to read 4 bytes at once.
+*
+* Arguments:   - stream256_state *state: pointer to stream state
+* - uint8_t *buf: pointer to buffer
+* - size_t *buf_len: pointer to buffer length
+* - size_t *buf_pos: pointer to current bit position
+*
+* Returns:     Random double value.
+**************************************************/
+
+// static double get_random_double(stream256_state *state, uint8_t *buf, size_t *buf_len, size_t *buf_pos) {
+//     uint32_t r;
+
+//     /* 1. Buffer check (byte-wise) */
+//     if (*buf_pos + 32 > (*buf_len) * 8) {
+//         stream256_squeezeblocks(buf, 1, state);
+//         *buf_len = STREAM256_BLOCKBYTES;
+//         *buf_pos = 0;
+//     }
+
+//     /* 2. Read 4 bytes at once */
+//     size_t idx = *buf_pos / 8;
+//     r = (uint32_t)buf[idx] 
+//       | ((uint32_t)buf[idx + 1] << 8) 
+//       | ((uint32_t)buf[idx + 2] << 16) 
+//       | ((uint32_t)buf[idx + 3] << 24);
+
+//     /* 3. Update pointer */
+//     *buf_pos += 32;
+
+//     /* 4. Return double */
+//     return (double)r / 4294967296.0;
+// }
+
+
+/*************************************************
+* Name:        get_random_uint32
+*
+* Description: Extracts a 32-bit unsigned integer from a buffered stream.
+* Refills the buffer from the stream when necessary.
+* Note: The buffer position (buf_pos) is tracked in bits.
+*
+* Arguments:   - stream256_state *state: pointer to the stream state
+* - uint8_t *buf: pointer to the buffer
+* - size_t *buf_len: pointer to the buffer length (in bytes)
+* - size_t *buf_pos: pointer to the current bit position in the buffer
+*
+* Returns:     A 32-bit unsigned integer.
+**************************************************/
+static inline uint32_t get_random_uint32(stream256_state *state, uint8_t *buf, size_t *buf_len, size_t *buf_pos) {
+
+    if (*buf_pos + 32 > (*buf_len) * 8) { 
+        stream256_squeezeblocks(buf, 1, state);
+        *buf_len = STREAM256_BLOCKBYTES;
+        *buf_pos = 0;
+    }
+    
+    uint32_t r;
+    memcpy(&r, &buf[*buf_pos / 8], 4);
+    
+    *buf_pos += 32;
+    return r; 
+}
+
+
+/*************************************************
+* Name:        Sample_Z
+*
+* Description: Performs the 3C sampling rejection step for the first component.
+* Determines z0 and x based on the challenge c and masking y0.
+*
+* Arguments:   - poly *z0: pointer to output polynomial z0
+* - poly *x: pointer to output polynomial x
+* - const poly *c: pointer to challenge polynomial
+* - const poly *y0: pointer to masking polynomial
+* - stream256_state *state: pointer to RNG state
+*
+* Returns:     1 if sampling is successful (accept), 0 otherwise (reject).
+**************************************************/
+int Sample_Z(poly *z0, poly *x, const poly *c, const poly *y0, stream256_state *state) {
+    uint8_t buf[STREAM256_BLOCKBYTES];
+    size_t buf_len = 0;
+    size_t buf_pos = STREAM256_BLOCKBYTES * 8; 
+
+   /* Pre-compute pointers for optimization */
+    const int16_t *c_coeffs = c->coeffs;
+    const int16_t *y0_coeffs = y0->coeffs;
+    int16_t *z0_coeffs = z0->coeffs;
+    int16_t *x_coeffs = x->coeffs;
+
+    for (int i = 0; i < N; ++i) {
+        int32_t y_val = y0_coeffs[i];
+        
+        /* Main loop */
+        if (c_coeffs[i] == 1) {
+            /* 1. Get random number */
+            uint32_t rnd32 = get_random_uint32(state, buf, &buf_len, &buf_pos);
+            
+            /* 2. Integer arithmetic (no division) */
+            int64_t num_a = TAU0 + y_val;
+            int64_t den_a = TAU0 - y_val + 1;
+            
+            // Check 1
+            uint64_t lhs_a = (uint64_t)rnd32 * den_a;
+            uint64_t rhs_a = (uint64_t)SCALED_M_INV * num_a;
+            
+            if (lhs_a < rhs_a) {
+                z0_coeffs[i] = y_val - 1;
+                x_coeffs[i] = -2;
+            } else {
+                // Check 2
+                int64_t num_b = TAU0 - y_val;
+                int64_t den_b = TAU0 + y_val + 1;
+                
+                uint64_t lhs_total = lhs_a * den_b; 
+                uint64_t rhs_total = (uint64_t)SCALED_M_INV * (num_a * den_b + num_b * den_a);
+                
+                if (lhs_total < rhs_total) {
+                    z0_coeffs[i] = y_val + 1;
+                    x_coeffs[i] = 0;
+                } else {
+                    return 0; // Reject
+                }
+            }
+        } else {
+            z0_coeffs[i] = y_val;
+            x_coeffs[i] = 0;
+        }
+        
+        /* Final check: Norm validation */
+        if (abs(z0_coeffs[i]) > B0) return 0;
+    }
+    return 1;
+}
 /*************************************************
 * Name:        get_random_bit
 *
@@ -279,7 +565,9 @@ void SampleY(polyvecl *y,
     SampleX_poly(&x_prime, &c_prime, seed_x_prime, nonce);
     poly_add(&c_plus_x_prime, &c_prime, &x_prime);
     for (int i = 0; i < K + L; ++i) {
-        poly_mul_integer(&y2_part1.vec[i], &s_prime->vec[i], &c_plus_x_prime);
+        
+        //poly_mul_integer(&y2_part1.vec[i], &s_prime->vec[i], &c_plus_x_prime);
+        poly_mul_sparse_ternary(&y2_part1.vec[i], &s_prime->vec[i], &c_prime, &x_prime);
     }
 
     
@@ -288,7 +576,8 @@ void SampleY(polyvecl *y,
     poly_add(&c_plus_x_prime2, &c_prime2, &x_prime2);
 
     
-    poly_mul_integer(&y2_part2.vec[0], s_bar_prime_0, &c_plus_x_prime2);
+    //poly_mul_integer(&y2_part2.vec[0], s_bar_prime_0, &c_plus_x_prime2);
+    poly_mul_sparse_ternary(&y2_part2.vec[0], s_bar_prime_0, &c_prime2, &x_prime2);
     for (int i = 1; i < K + L; ++i) {
         poly_zero(&y2_part2.vec[i]);
     }
@@ -423,4 +712,5 @@ void poly_uniform_ntt(poly *a, const uint8_t seed[SEEDBYTES], uint16_t nonce) {
         // Call rej_uniform (expects buffer, buffer length, pointer to position)
         ctr += rej_uniform(a->coeffs + ctr, N - ctr, buf, buflen, &pos);
     }
+    stream128_free(&state);
 }

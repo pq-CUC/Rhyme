@@ -1,4 +1,3 @@
-// src/encoding.c (Using Mode 2 tables for all modes)
 #include "encoding.h"
 #include "params.h"        // For K, L, N, B_INFTY
 #include "polyvec.h"       // For polyvecl
@@ -12,26 +11,37 @@
 #include <inttypes.h>      // For PRId32
 
 // --- rANS Parameters ---
-#define SCALE_BITS_Z 16  // *** Using 16 bits ***
-#define SCALE_Z (1U << SCALE_BITS_Z) // *** 65536 ***
+#define SCALE_BITS_Z 16  
+#define SCALE_Z (1U << SCALE_BITS_Z) //  65536 
 
 
 
 #if ccc_MODE == 2 && TAU == 30
-    #include "rans_tables_tau30.h"
-    #define CURRENT_DSYMS_Z dsyms_z_tau30
-    #define CURRENT_ESYMS_Z esyms_z_tau30
-    #define CURRENT_SYMBOL_Z symbol_z_tau30
+    #include "rans_tables_tau30_split.h" 
+    #define DSYMS_Z0      dsyms_z0_tau30
+    #define ESYMS_Z0      esyms_z0_tau30
+    #define SYMBOL_Z0     symbol_z0_tau30
+    #define DSYMS_Z_REST  dsyms_z_rest_tau30
+    #define ESYMS_Z_REST  esyms_z_rest_tau30
+    #define SYMBOL_Z_REST symbol_z_rest_tau30
+
 #elif ccc_MODE == 3 && TAU == 60 
-    #include "rans_tables_tau60.h"
-    #define CURRENT_DSYMS_Z dsyms_z_tau60
-    #define CURRENT_ESYMS_Z esyms_z_tau60
-    #define CURRENT_SYMBOL_Z symbol_z_tau60
+    #include "rans_tables_tau60_split.h"
+    #define DSYMS_Z0      dsyms_z0_tau60
+    #define ESYMS_Z0      esyms_z0_tau60
+    #define SYMBOL_Z0     symbol_z0_tau60
+    #define DSYMS_Z_REST  dsyms_z_rest_tau60
+    #define ESYMS_Z_REST  esyms_z_rest_tau60
+    #define SYMBOL_Z_REST symbol_z_rest_tau60
+
 #elif ccc_MODE == 5 && TAU == 128
-    #include "rans_tables_tau128.h"
-    #define CURRENT_DSYMS_Z dsyms_z_tau128
-    #define CURRENT_ESYMS_Z esyms_z_tau128
-    #define CURRENT_SYMBOL_Z symbol_z_tau128
+    #include "rans_tables_tau128_split.h"
+    #define DSYMS_Z0      dsyms_z0_tau128
+    #define ESYMS_Z0      esyms_z0_tau128
+    #define SYMBOL_Z0     symbol_z0_tau128
+    #define DSYMS_Z_REST  dsyms_z_rest_tau128
+    #define ESYMS_Z_REST  esyms_z_rest_tau128
+    #define SYMBOL_Z_REST symbol_z_rest_tau128
 #else
     #error "Unsupported ccc_MODE or TAU value for rANS tables in encoding.c."
 #endif
@@ -64,8 +74,22 @@ uint16_t encode_z(uint8_t *buf, const polyvecl *z) {
 
     RansEncInit(&rans);
 
+    /* Iterate over polynomial vector (reverse order) */
     for (size_t vec_idx_rev = 0; vec_idx_rev < K + L; ++vec_idx_rev) {
-        size_t vec_idx = K + L - 1 - vec_idx_rev;
+        size_t vec_idx = K + L - 1 - vec_idx_rev; 
+        
+        /* Select appropriate encoding and decoding tables */
+        const RansEncSymbol *current_esyms;
+        const RansDecSymbol *current_dsyms; 
+
+        if (vec_idx == 0) {
+            current_esyms = ESYMS_Z0;
+            current_dsyms = DSYMS_Z0;       /* Select z0 table */
+        } else {
+            current_esyms = ESYMS_Z_REST;
+            current_dsyms = DSYMS_Z_REST;  /* Select z_rest table */
+        }
+
         for (size_t coeff_idx_rev = 0; coeff_idx_rev < N; ++coeff_idx_rev) {
             size_t coeff_idx = N - 1 - coeff_idx_rev;
             int32_t val = z->vec[vec_idx].coeffs[coeff_idx];
@@ -78,13 +102,15 @@ uint16_t encode_z(uint8_t *buf, const polyvecl *z) {
             
             uint16_t symbol = (uint16_t)(val + OFFSET_Z);
 
-            if (symbol >= NUM_SYMBOLS_Z || CURRENT_DSYMS_Z[symbol].freq == 0) {
+            /* Use current_dsyms for frequency check */
+            if (symbol >= NUM_SYMBOLS_Z || current_dsyms[symbol].freq == 0) {
                  fprintf(stderr, "[MODE %d] Error: Attempting to encode symbol %u (val %d) with freq 0!\n",
                          ccc_MODE, symbol, val);
                  free(encoding_buffer); return 0;
             }
 
-            RansEncPutSymbol(&rans, &ptr, &CURRENT_ESYMS_Z[symbol]);
+            /* Use current_esyms for encoding */
+            RansEncPutSymbol(&rans, &ptr, &current_esyms[symbol]);
 
             if (ptr < encoding_buffer) {
                  fprintf(stderr, "[MODE %d] Error: rANS temp buffer underflow!\n", ccc_MODE);
@@ -127,10 +153,20 @@ int decode_z(polyvecl *z, const uint8_t *buf, uint16_t size_in) {
     if (RansDecInit(&rans, (uint8_t **)&ptr)) { return 2; }
 
     for (size_t vec_idx = 0; vec_idx < K + L; ++vec_idx) {
+        const RansDecSymbol *current_dsyms;
+        const uint16_t *current_lut;
+        
+        if (vec_idx == 0) {
+            current_dsyms = DSYMS_Z0;
+            current_lut   = SYMBOL_Z0;
+        } else {
+            current_dsyms = DSYMS_Z_REST;
+            current_lut   = SYMBOL_Z_REST;
+        }
         for (size_t coeff_idx = 0; coeff_idx < N; ++coeff_idx) {
             if (ptr > buf_end) { return 9; }
             uint16_t slot = RansDecGet(&rans, SCALE_BITS_Z);
-            uint16_t symbol = CURRENT_SYMBOL_Z[slot];
+            uint16_t symbol = current_lut[slot];
             
             if (symbol >= NUM_SYMBOLS_Z) { return 4; }
             
@@ -138,7 +174,7 @@ int decode_z(polyvecl *z, const uint8_t *buf, uint16_t size_in) {
             z->vec[vec_idx].coeffs[coeff_idx] = val;
             coeffs_decoded++;
             
-            RansDecAdvanceSymbol(&rans, (uint8_t **)&ptr, buf_end, &CURRENT_DSYMS_Z[symbol], SCALE_BITS_Z);
+            RansDecAdvanceSymbol(&rans, (uint8_t **)&ptr, buf_end, &current_dsyms[symbol], SCALE_BITS_Z);
             
             if (ptr > buf_end && coeffs_decoded < total_coeffs) { return 5; }
         }
