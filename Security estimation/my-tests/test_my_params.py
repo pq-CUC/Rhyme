@@ -1,16 +1,16 @@
-# File: lattice-estimator-main/my-lwe-tests/test_my_params.py
-
 # --- Code required for the solution ---
 import sys
+import math
 # Add the directory containing the estimator library to Python's search path
 sys.path.append('/lattice-estimator')
 # --- Code required for the solution ---
-
+from sage.all import oo, log
 # 1. Import all functionalities from the estimator library
 from estimator import *
+from estimator.reduction import ADPS16
 
 print("="*60)
-print(" Security Assessment for Rhyme Scheme ({-1,0,1} distribution @ probabilities 0.25,0.5,0.25)")
+print(" Security Assessment for Rhyme Scheme (Binary {0, 1} distribution)")
 print("="*60)
 
 # 2. Define the three parameter sets for Rhyme
@@ -31,10 +31,10 @@ for name, params in rhyme_params.items():
     lwe_m = params["n_ring"] * params["l"]
 
     # --- Code modification start ---
-    # Model the distribution {-1, 0, 1} with probabilities 0.25, 0.5, 0.25.
-    # ND.TUniform(0) accurately describes this distribution.
-    # Its mean is 0 and its standard deviation is sqrt(0.5) ≈ 0.7071.
-    dist = ND.TUniform(0)
+    # Change to Uniform distribution over {0, 1}
+    # This corresponds to Binary-LWE where s, e <- {0, 1}
+    # Mean = 0.5, Stddev = 0.5
+    dist = ND.Uniform(0, 1)
     # --- Code modification end ---
 
     mlwe_params = LWE.Parameters(
@@ -50,7 +50,7 @@ for name, params in rhyme_params.items():
 
     # --- Classical security evaluation ---
     print("\n--- [Classical] Key Recovery Evaluation Results ---")
-    lwe_results_classical = LWE.estimate(mlwe_params, quiet=True, red_cost_model=RC.MATZOV)
+    lwe_results_classical = LWE.estimate(mlwe_params, quiet=True, red_cost_model=RC.MATZOV, red_shape_model="cn11")
 
     min_lwe_classical = oo
     for attack, cost in lwe_results_classical.items():
@@ -67,7 +67,7 @@ for name, params in rhyme_params.items():
 
     # --- Quantum security evaluation ---
     print("\n--- [Quantum] Key Recovery Evaluation Results ---")
-    lwe_results_quantum = LWE.estimate(mlwe_params, quiet=True, red_cost_model=RC.ChaLoy21)
+    lwe_results_quantum = LWE.estimate(mlwe_params, quiet=True, red_cost_model=RC.ChaLoy21, red_shape_model="cn11")
 
     min_lwe_quantum = oo
     for attack, cost in lwe_results_quantum.items():
@@ -83,12 +83,13 @@ for name, params in rhyme_params.items():
         print("==> [Quantum] Key Recovery Security Level: Not determined\n")
 
 
-    # B. Security evaluation for forgery attack (MSIS -> SIS) (this part is independent of the distribution of s and remains unchanged)
+    # B. Security evaluation for forgery attack (MSIS -> SIS)
+    # (Note: MSIS part is generally independent of the secret distribution s, depending mostly on dimensions and bound B)
     print(">>> (B) Forgery Attack (MSIS -> SIS)")
 
     sis_n = params["n_ring"] * params["k"]
     sis_m = params["n_ring"] * (params["k"] + params["l"])
-    sis_bound = 1 * params["B"]
+    sis_bound = params["B"]
 
     msis_params = SIS.Parameters(
         n=sis_n,
