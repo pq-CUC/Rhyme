@@ -41,7 +41,12 @@ static void build_one(rtable *t) {
         start += t->freq[s];
     }
 }
-static void build_tables(void) {
+/* Build the rANS lookup tables once. Exposed via rhyme_encoding_init() so that
+ * table construction (a one-time cost, not part of signing) is hoisted out of
+ * the sign/verify hot path. The tables_ready guard keeps encode_z/decode_z
+ * correct even if init is not called explicitly: the first call builds them,
+ * every later call returns immediately. */
+void RHYME_NAMESPACE(encoding_init)(void) {
     if (tables_ready) return;
     build_one(&T1); build_one(&TS);
     tables_ready = 1;
@@ -92,7 +97,7 @@ static int rr_get(rawr *r, unsigned bits, uint32_t *out) {
 
 /* ---------------- encode ---------------- */
 size_t encode_z(uint8_t *buf, size_t cap, const poly *z1, const poly z_rest[D_REST]) {
-    build_tables();
+    RHYME_NAMESPACE(encoding_init)();
     size_t tmpcap = (size_t)(1 + D_REST) * N * 4 + 256;
     uint8_t *rtmp = malloc(tmpcap);
     uint8_t *rawbuf = malloc(tmpcap);
@@ -155,7 +160,7 @@ size_t encode_z(uint8_t *buf, size_t cap, const poly *z1, const poly z_rest[D_RE
 
 /* ---------------- decode ---------------- */
 int decode_z(poly *z1, poly z_rest[D_REST], const uint8_t *buf, size_t len) {
-    build_tables();
+    RHYME_NAMESPACE(encoding_init)();
     if (len < 2 + 4) return 1;
     size_t rans_len = (size_t)buf[0] | ((size_t)buf[1] << 8);
     if (2 + rans_len > len) return 2;

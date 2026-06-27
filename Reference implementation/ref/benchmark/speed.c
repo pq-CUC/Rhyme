@@ -4,6 +4,8 @@
 #include <time.h>
 #include "params.h"
 #include "sign.h"
+#include "encoding.h"
+#include "zpntt.h"
 #include "poly.h"
 #include "ntt.h"
 #include "sampler.h"
@@ -51,6 +53,15 @@ int main(void) {
 
     printf("=== %s  (pk %d B, sk %d B, sig cap %d B) ===\n",
            CRYPTO_ALGNAME, CRYPTO_PUBLICKEYBYTES, CRYPTO_SECRETKEYBYTES, CRYPTO_BYTES);
+
+    /* one-time, key-independent setup, excluded from ALL measured timings
+     * (keygen/sign/verify): the rANS lookup tables and the NTT twiddle-factor
+     * (zeta) table. Both are global constants shared by every operation, so
+     * building them is process setup, not part of any single operation.
+     * (Per-key work such as the NTT form of the secret basis stays inside
+     * sign, matching the benchmarking convention of Dilithium/HAETAE.) */
+    rhyme_encoding_init();
+    zpntt_init();
 
     /* ---------------- key generation ---------------- */
     clock_t c0 = clock();

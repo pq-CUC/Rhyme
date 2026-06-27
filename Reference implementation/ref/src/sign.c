@@ -13,6 +13,7 @@
 #include "sign.h"
 #include "poly.h"
 #include "packing.h"
+#include "encoding.h"
 #include "sampler.h"
 #include "symmetric.h"
 #include "fips202.h"
@@ -235,6 +236,7 @@ int crypto_sign_keypair_from_basis(uint8_t *pk, uint8_t *sk,
 * Returns:     0 on success, nonzero on failure.
 **************************************************/
 int crypto_sign_keypair(uint8_t *pk, uint8_t *sk) {
+    rhyme_encoding_init();   /* build rANS tables once, outside the sign hot path */
     uint8_t seedbuf[2 * SEEDBYTES + SEEDBYTES];
     uint8_t root[SEEDBYTES];
     randombytes(root, SEEDBYTES);
@@ -476,6 +478,7 @@ int crypto_sign(uint8_t *sm, size_t *smlen, const uint8_t *m, size_t mlen,
 **************************************************/
 int crypto_sign_verify(const uint8_t *sig, size_t siglen,
                        const uint8_t *m, size_t mlen, const uint8_t *pk) {
+    rhyme_encoding_init();   /* ensure tables exist for verify-only processes */
     uint8_t seedA[SEEDBYTES];
     uint8_t mu[CRHBYTES], c_tilde[CTILDEBYTES], c_tilde2[CTILDEBYTES];
     uint8_t wbuf[W_PACKEDBYTES];
