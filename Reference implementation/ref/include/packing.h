@@ -1,61 +1,51 @@
-#ifndef CCC_PACKING_H
-#define CCC_PACKING_H
-
-#include "params.h"
-#include "polyvec.h"
-#include "poly.h"
+#ifndef RHYME_PACKING_H
+#define RHYME_PACKING_H
 #include <stdint.h>
-#include <stddef.h> 
-#include "config.h"
-#include "encoding.h" // Include encoding header
+#include <stddef.h>
+#include "params.h"
+#include "poly.h"
 
-// Public Key Packing/Unpacking
-#define pack_pk ccc_NAMESPACE(pack_pk)
-size_t pack_pk(uint8_t *pk, const uint8_t seedA[SEEDBYTES], const polyveck *b);
-#define unpack_pk ccc_NAMESPACE(unpack_pk)
-int unpack_pk(uint8_t seedA[SEEDBYTES], polyveck *b, const uint8_t *pk, size_t pklen);
- 
-// Secret Key Packing/Unpacking
-#define pack_sk ccc_NAMESPACE(pack_sk)
-size_t pack_sk(uint8_t *sk, const uint8_t *pk, size_t pklen, const polyvecm *s_gen, const polyveck *e_gen, const polyvecl *s_prime, const poly *s_bar_prime_0, const uint8_t key[SEEDBYTES]);
+/* secret basis B  (Construction 4 "cut-F", ours = transpose of the
+ * HAWK/MNTRU-generated full (d+1)x(d+1) unimodular matrix):
+ *   rows 0..D_UNI-1 (= d rows) are SHORT (|coeff| <= ~ETA after CBD; int8),
+ *   row D_UNI (the (d+1)-th, big solved NTRU row) holds large coeffs (int16).
+ * Every row has D_SOLVE = d+1 column-polys.
+ * Column 0 of B is the secret column; its first d entries are
+ * s_tail = (sgen | egen).  The (d+1)-th entry of column 0 (row_big[0]) belongs
+ * to the discarded extension dimension and never enters the signature. */
+typedef struct {
+    poly row_small[D_UNI][D_SOLVE];  /* d short rows, each d+1 polys */
+    poly row_big[D_SOLVE];           /* the long (d+1)-th row, d+1 polys */
+} secret_basis;
 
-#define unpack_sk ccc_NAMESPACE(unpack_sk)
-int unpack_sk(uint8_t *pk, size_t *pklen, polyvecm *s_gen, polyveck *e_gen, polyvecl *s_prime, poly *s_bar_prime_0, uint8_t key[SEEDBYTES], const uint8_t *sk, size_t sklen);
-// Signature Packing/Unpacking
-#define pack_sig ccc_NAMESPACE(pack_sig)
-size_t pack_sig(uint8_t sig[CRYPTO_BYTES], const poly *z0, const polyvecd_rest *z_rest, const poly *c);
-#define unpack_sig ccc_NAMESPACE(unpack_sig)
-int unpack_sig(poly *z0, polyvecd_rest *z_rest, poly *c, const uint8_t *sig, size_t siglen);
+#define pack_pk RHYME_NAMESPACE(pack_pk)
+#define unpack_pk RHYME_NAMESPACE(unpack_pk)
+#define pack_sk RHYME_NAMESPACE(pack_sk)
+#define unpack_sk RHYME_NAMESPACE(unpack_sk)
+#define pack_w RHYME_NAMESPACE(pack_w)
+#define pack_sig RHYME_NAMESPACE(pack_sig)
+#define unpack_sig RHYME_NAMESPACE(unpack_sig)
 
+void pack_pk(uint8_t pk[CRYPTO_PUBLICKEYBYTES], const uint8_t seedA[SEEDBYTES],
+             const poly b[K]);
+void unpack_pk(uint8_t seedA[SEEDBYTES], poly b[K],
+               const uint8_t pk[CRYPTO_PUBLICKEYBYTES]);
 
+void pack_sk(uint8_t sk[CRYPTO_SECRETKEYBYTES],
+             const uint8_t pk[CRYPTO_PUBLICKEYBYTES],
+             const secret_basis *B, const uint8_t key[SEEDBYTES]);
+void unpack_sk(uint8_t pk[CRYPTO_PUBLICKEYBYTES], secret_basis *B,
+               uint8_t key[SEEDBYTES], const uint8_t sk[CRYPTO_SECRETKEYBYTES]);
 
-#define pack_polyveck_sigma1 ccc_NAMESPACE(pack_polyveck_sigma1)
-void pack_polyveck_sigma1(uint8_t *buf, const polyveck *s_k);
-#define unpack_polyveck_sigma1 ccc_NAMESPACE(unpack_polyveck_sigma1)
-void unpack_polyveck_sigma1(polyveck *s_k, const uint8_t *buf);
+/* pack w in [0,2q)^N per poly, POLY2Q_BITS each, K polys -> for hashing */
+#define W_PACKEDBYTES (K * POLY_PACKEDBYTES_2Q)
+void pack_w(uint8_t buf[W_PACKEDBYTES], const poly w[K]);
 
-#define pack_polyvecm_sigma1 ccc_NAMESPACE(pack_polyvecm_sigma1)
-void pack_polyvecm_sigma1(uint8_t *buf, const polyvecm *s_m);
-#define unpack_polyvecm_sigma1 ccc_NAMESPACE(unpack_polyvecm_sigma1)
-void unpack_polyvecm_sigma1(polyvecm *s_m, const uint8_t *buf);
+/* signature = c-seed bytes? we transmit challenge as hash output c_tilde (CRHBYTES)
+ * + encoded z (z1, z_rest[D_REST]).  returns length or -1 on overflow. */
+int pack_sig(uint8_t sig[CRYPTO_BYTES], size_t *siglen,
+             const uint8_t c_tilde[CTILDEBYTES], const poly *z1, const poly z_rest[D_REST]);
+int unpack_sig(uint8_t c_tilde[CTILDEBYTES], poly *z1, poly z_rest[D_REST],
+               const uint8_t *sig, size_t siglen);
 
-#define pack_polyvecl_sigma1 ccc_NAMESPACE(pack_polyvecl_sigma1)
-void pack_polyvecl_sigma1(uint8_t *buf, const polyvecl *s);
-#define unpack_polyvecl_sigma1 ccc_NAMESPACE(unpack_polyvecl_sigma1)
-void unpack_polyvecl_sigma1(polyvecl *s, const uint8_t *buf);
-
-#define pack_poly_challenge ccc_NAMESPACE(pack_poly_challenge)
-void pack_poly_challenge(uint8_t *buf, const poly *c);
-#define unpack_poly_challenge ccc_NAMESPACE(unpack_poly_challenge)
-void unpack_poly_challenge(poly *c, const uint8_t *buf);
-
-#define pack_polyveck_2q ccc_NAMESPACE(pack_polyveck_2q)
-void pack_polyveck_2q(uint8_t *buf, const polyveck *v);
-
-
-#define pack_polyvecl_s_prime ccc_NAMESPACE(pack_polyvecl_s_prime)
-void pack_polyvecl_s_prime(uint8_t *buf, const polyvecl *s_prime);
-
-#define unpack_polyvecl_s_prime ccc_NAMESPACE(unpack_polyvecl_s_prime)
-void unpack_polyvecl_s_prime(polyvecl *s_prime, const uint8_t *buf);
-#endif // CCC_PACKING_H
+#endif

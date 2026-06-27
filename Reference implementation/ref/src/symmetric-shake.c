@@ -3,7 +3,8 @@
 #include "symmetric.h"
 #include <stdint.h>
 
-void ccc_shake128_stream_init(keccak_state *state,
+#ifndef RHYME_USE_AES
+void rhyme_shake128_stream_init(keccak_state *state,
                                  const uint8_t seed[SEEDBYTES],
                                  uint16_t nonce) {
     uint8_t t[2];
@@ -16,7 +17,7 @@ void ccc_shake128_stream_init(keccak_state *state,
     shake128_finalize(state);
 }
 
-void ccc_shake256_stream_init(keccak_state *state,
+void rhyme_shake256_stream_init(keccak_state *state,
                                  const uint8_t seed[CRHBYTES], uint16_t nonce) {
     uint8_t t[2];
     t[0] = nonce;
@@ -28,7 +29,7 @@ void ccc_shake256_stream_init(keccak_state *state,
     shake256_finalize(state);
 }
 
-void ccc_shake256_absorb_twice(keccak_state *state, const uint8_t *in1,
+void rhyme_shake256_absorb_twice(keccak_state *state, const uint8_t *in1,
                                   size_t in1len, const uint8_t *in2,
                                   size_t in2len) {
     shake256_init(state);
@@ -36,3 +37,4 @@ void ccc_shake256_absorb_twice(keccak_state *state, const uint8_t *in1,
     shake256_absorb(state, in2, in2len);
     shake256_finalize(state);
 }
+#endif /* !RHYME_USE_AES */

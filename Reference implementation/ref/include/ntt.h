@@ -1,23 +1,20 @@
-#ifndef NTT_H
-#define NTT_H
-
-#include "params.h" 
-#include "config.h" 
+#ifndef RHYME_NTT_H
+#define RHYME_NTT_H
 #include <stdint.h>
+#include "params.h"
 
-#define ntt ccc_NAMESPACE(ntt)
-void ntt(int16_t a[N]);
+#define ntt RHYME_NAMESPACE(ntt)
+#define invntt_tomont RHYME_NAMESPACE(invntt_tomont)
+#define basemul RHYME_NAMESPACE(basemul)
+#define ntt_pointwise_acc RHYME_NAMESPACE(ntt_pointwise_acc)
 
-#define invntt_tomont ccc_NAMESPACE(invntt_tomont)
-void invntt_tomont(int16_t a[N]);
-
-#define fqmul ccc_NAMESPACE(fqmul)
-int16_t fqmul(int16_t a, int16_t b);
-
-#define zetas ccc_NAMESPACE(zetas)
-extern  int16_t zetas[128];
-
-#define basemul ccc_NAMESPACE(basemul)
-void basemul(int16_t r[2], const int16_t a[2], const int16_t b[2], int16_t zeta);
-
+/* in-place forward incomplete NTT (degree-4 blocks), coefficients int32 (any range) */
+void ntt(int32_t a[N]);
+/* in-place inverse; output multiplied by 2^32 (Montgomery domain compensation) */
+void invntt_tomont(int32_t a[N]);
+/* c = a*b for NTT-domain vectors (deg-4 blockwise), Montgomery semantics:
+ * if a,b in standard NTT domain, output = a*b * R^{-1}.  */
+void basemul(int32_t c[N], const int32_t a[N], const int32_t b[N]);
+/* c += a*b (blockwise), same Montgomery semantics */
+void ntt_pointwise_acc(int32_t c[N], const int32_t a[N], const int32_t b[N]);
 #endif

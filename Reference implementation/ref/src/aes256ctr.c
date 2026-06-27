@@ -1,136 +1,69 @@
-#include "aes256ctr.h"
+/* AES-256-CTR via AES-NI (no OpenSSL).  Used as the fast PRF/XOF substitute
+ * in hybrid mode (RHYME_USE_AES): Agen expansion (stream128) and all sampling
+ * streams (stream256), mirroring the old scheme's hybrid design. */
+#include <stdint.h>
 #include <string.h>
-#include <stdlib.h>
-#include <openssl/evp.h> 
+#include <wmmintrin.h>
+#include <emmintrin.h>
+#include "aes256ctr.h"
 
-/*************************************************
-* Name:        make_iv
-*
-* Description: Helper function to construct the 16-byte Initialization Vector (IV)
-* from a 64-bit nonce. The nonce is copied into the first 8 bytes,
-* and the remaining bytes are zeroed.
-*
-* Arguments:   - uint8_t iv[16]: output IV buffer
-* - uint64_t nonce: 64-bit nonce value
-**************************************************/
-static void make_iv(uint8_t iv[16], uint64_t nonce) {
-    memset(iv, 0, 16);
-    // Copy the 64-bit nonce to the first 8 bytes of the IV
-    memcpy(iv, &nonce, sizeof(nonce)); 
+static __m128i expand_step(__m128i k0, __m128i kga) {
+    kga = _mm_shuffle_epi32(kga, 0xff);
+    k0 = _mm_xor_si128(k0, _mm_slli_si128(k0, 4));
+    k0 = _mm_xor_si128(k0, _mm_slli_si128(k0, 4));
+    k0 = _mm_xor_si128(k0, _mm_slli_si128(k0, 4));
+    return _mm_xor_si128(k0, kga);
+}
+static __m128i expand_step2(__m128i k1, __m128i k0n) {
+    __m128i kga = _mm_aeskeygenassist_si128(k0n, 0);
+    kga = _mm_shuffle_epi32(kga, 0xaa);
+    k1 = _mm_xor_si128(k1, _mm_slli_si128(k1, 4));
+    k1 = _mm_xor_si128(k1, _mm_slli_si128(k1, 4));
+    k1 = _mm_xor_si128(k1, _mm_slli_si128(k1, 4));
+    return _mm_xor_si128(k1, kga);
+}
+static void key_expand(__m128i rk[15], const uint8_t key[32]) {
+    rk[0] = _mm_loadu_si128((const __m128i *)key);
+    rk[1] = _mm_loadu_si128((const __m128i *)(key + 16));
+#define EXP(i, rc) \
+    rk[i] = expand_step(rk[i-2], _mm_aeskeygenassist_si128(rk[i-1], rc)); \
+    if (i + 1 < 15) rk[i+1] = expand_step2(rk[i-1], rk[i]);
+    EXP(2, 0x01) EXP(4, 0x02) EXP(6, 0x04) EXP(8, 0x08)
+    EXP(10, 0x10) EXP(12, 0x20) EXP(14, 0x40)
+#undef EXP
+}
+static __m128i enc_block(const __m128i rk[15], __m128i x) {
+    x = _mm_xor_si128(x, rk[0]);
+    for (int i = 1; i < 14; i++) x = _mm_aesenc_si128(x, rk[i]);
+    return _mm_aesenclast_si128(x, rk[14]);
 }
 
-/*************************************************
-* Name:        aes256ctr_set_nonce
-*
-* Description: Resets the nonce (IV) in the AES state without re-initializing the key.
-* This optimization avoids the overhead of key expansion when only
-* the nonce changes.
-*
-* Arguments:   - aes256ctr_ctx *state: pointer to the AES-CTR state
-* - uint64_t nonce: new 64-bit nonce
-**************************************************/
-void aes256ctr_set_nonce(aes256ctr_ctx *state, uint64_t nonce) {
-    uint8_t iv[16];
-    make_iv(iv, nonce);
-    
-    EVP_CIPHER_CTX *ctx = (EVP_CIPHER_CTX *)state->ctx;
-    if (!ctx) return;
-
-    // OpenSSL allows resetting the IV while keeping the Key by passing NULL for key.
-    // This is more efficient than full initialization.
-    EVP_EncryptInit_ex(ctx, NULL, NULL, NULL, iv);
-}
-
-/*************************************************
-* Name:        aes256ctr_init
-*
-* Description: Initializes the AES-256-CTR state with a key and a nonce.
-* Allocates the OpenSSL cipher context.
-*
-* Arguments:   - aes256ctr_ctx *state: pointer to the state to initialize
-* - const uint8_t key[32]: pointer to the 32-byte secret key
-* - uint64_t nonce: 64-bit nonce
-**************************************************/
 void aes256ctr_init(aes256ctr_ctx *state, const uint8_t key[32], uint64_t nonce) {
-    uint8_t iv[16];
-    make_iv(iv, nonce);
-
-    // Allocate context
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    state->ctx = (void *)ctx; 
-
-    if (ctx) {
-        // Initialize as AES-256-CTR
-        EVP_EncryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, key, iv);
-    }
+    key_expand(state->rk, key);
+    state->ctr = _mm_set_epi64x(0, (long long)nonce);
 }
-
-/*************************************************
-* Name:        aes256ctr_squeezeblocks
-*
-* Description: Generates pseudo-random bytes by encrypting a zero-buffer.
-* The output is written to the 'out' buffer.
-*
-* Arguments:   - uint8_t *out: pointer to the output buffer
-* - size_t nblocks: number of 16-byte blocks to generate
-* - aes256ctr_ctx *state: pointer to the AES-CTR state
-**************************************************/
+void aes256ctr_set_nonce(aes256ctr_ctx *state, uint64_t nonce) {
+    state->ctr = _mm_set_epi64x(0, (long long)nonce);
+}
 void aes256ctr_squeezeblocks(uint8_t *out, size_t nblocks, aes256ctr_ctx *state) {
-    int outlen;
-    size_t len = nblocks * AES256CTR_BLOCKBYTES;
-    
-    // Retrieve context
-    EVP_CIPHER_CTX *ctx = (EVP_CIPHER_CTX *)state->ctx;
-    if (!ctx) return;
-
-    // Encrypt zero-bytes to generate the keystream (pseudo-random output)
-    uint8_t *in_zeros = calloc(1, len); 
-    if (!in_zeros) return;
-
-    EVP_EncryptUpdate(ctx, out, &outlen, in_zeros, len);
-    
-    free(in_zeros);
+    for (size_t b = 0; b < nblocks; b++) {
+        for (int i = 0; i < 4; i++) {  /* AES256CTR_BLOCKBYTES = 64 */
+            __m128i o = enc_block(state->rk, state->ctr);
+            _mm_storeu_si128((__m128i *)(out + 64 * b + 16 * i), o);
+            state->ctr = _mm_add_epi64(state->ctr, _mm_set_epi64x(1, 0));
+        }
+    }
 }
-
-/*************************************************
-* Name:        aes256ctr_prf
-*
-* Description: AES-256-CTR based Pseudo-Random Function.
-* Generates 'outlen' bytes of output given a seed and nonce.
-* This is a self-contained function that initializes and frees the state.
-*
-* Arguments:   - uint8_t *out: pointer to output buffer
-* - size_t outlen: number of bytes to generate
-* - const uint8_t seed[32]: key/seed
-* - uint64_t nonce: nonce value
-**************************************************/
 void aes256ctr_prf(uint8_t *out, size_t outlen, const uint8_t seed[32], uint64_t nonce) {
-    aes256ctr_ctx state;
-    aes256ctr_init(&state, seed, nonce);
-
-    int len;
-    uint8_t *in_zeros = calloc(1, outlen);
-    
-    EVP_CIPHER_CTX *ctx = (EVP_CIPHER_CTX *)state.ctx;
-    if (ctx && in_zeros) {
-        EVP_EncryptUpdate(ctx, out, &len, in_zeros, outlen);
+    aes256ctr_ctx st;
+    uint8_t buf[64];
+    aes256ctr_init(&st, seed, nonce);
+    while (outlen) {
+        aes256ctr_squeezeblocks(buf, 1, &st);
+        size_t take = outlen > 64 ? 64 : outlen;
+        memcpy(out, buf, take);
+        out += take; outlen -= take;
     }
-    
-    if (in_zeros) free(in_zeros);
-    aes256ctr_free(&state);
+    aes256ctr_free(&st);
 }
-
-/*************************************************
-* Name:        aes256ctr_free
-*
-* Description: Frees the OpenSSL cipher context associated with the state.
-* Must be called to avoid memory leaks.
-*
-* Arguments:   - aes256ctr_ctx *state: pointer to the state to free
-**************************************************/
-void aes256ctr_free(aes256ctr_ctx *state) {
-    if (state && state->ctx) {
-        EVP_CIPHER_CTX_free((EVP_CIPHER_CTX *)state->ctx);
-        state->ctx = NULL;
-    }
-}
+void aes256ctr_free(aes256ctr_ctx *state) { (void)state; }

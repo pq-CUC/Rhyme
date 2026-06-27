@@ -1,513 +1,556 @@
-#include "sign.h"
-#include "packing.h"
-#include "params.h"
-#include "poly.h"
-#include "polymat.h"
-#include "polyvec.h"
-#include "randombytes.h"
-#include "symmetric.h"
-#include "ntt.h" 
-#include "sampler.h"
-#include "reduce.h"
-#include <stdlib.h> 
-#include <inttypes.h>
+/*************************************************
+* File:        sign.c
+*
+* Description: Rhyme signature scheme API: key-pair generation, signing
+*              (Fiat-Shamir with cut-F / widened-D unimodular basis, rANS
+*              entropy coding), and verification, plus the combined
+*              signed-message wrappers crypto_sign / crypto_sign_open.
+**************************************************/
+#include <stddef.h>
 #include <stdint.h>
 #include <string.h>
-#include <stdio.h>  
-#include <limits.h> 
-//unsigned long long global_sign_cycles_count = 0;
+#include "params.h"
+#include "sign.h"
+#include "poly.h"
+#include "packing.h"
+#include "sampler.h"
+#include "symmetric.h"
+#include "fips202.h"
+#include "randombytes.h"
+#include "reduce.h"
+#include <stdio.h>
 
+/* keygen solver (C port of the module-NTRU det=1 solver) */
+int rhyme_keygen_basis(secret_basis *B, const uint8_t seed[SEEDBYTES]);
+
+/* ------------------------------------------------------------------ helpers */
+
+/* w = 2*[ (Agen*ys + ye - b*y1) mod q ] + q*(parity j-term), all mod 2q.
+ * Agen in NTT domain (K x (L-1)); b in NTT domain (K); inputs y* standard.
+ * jpar: parity bit polynomial coefficient for the j-term (only row 0 gets q*par). */
 /*************************************************
-* Name:        center_coeff
+* Name:        compute_w
 *
-* Description: Centers a coefficient modulo q to the range [-q/2, q/2].
+* Description: Computes the commitment vector w = 2*[(Agen*ys + ye - b*y1) mod q] plus the
+*              parity j-term, reduced mod 2q. Agen and b are in NTT domain; the y* masks are
+*              in standard domain.
 *
-* Arguments:   - int32_t coeff: input coefficient
-*
-* Returns:     Centered coefficient.
+* Arguments:   - poly w[K]:                   output commitment vector
+*              - const poly Agen[K][M_SGEN]:  public matrix A in NTT domain
+*              - const poly b_ntt[K]:         public vector b in NTT domain
+*              - const poly *y1:              first mask polynomial
+*              - const poly y_rest[D_REST]:   remaining mask polynomials
+*              - int sub_par:                 parity bit for the j-term
 **************************************************/
-static inline int32_t center_coeff(int32_t coeff) {
-    // Assumes coeff is already reduced mod q, e.g., [0, Q-1]
-    int32_t c = coeff;
-    // Use freeze first to ensure it's in [0, Q-1] range robustly
-    c = freeze(coeff); // Ensure input is [0, Q-1] before centering
-    if (c > Q / 2) {
-        c -= Q;
+static void compute_w(poly w[K], const poly Agen[K][M_SGEN], const poly b_ntt[K],
+                      const poly *y1, const poly y_rest[D_REST], int sub_par) {
+    poly y1h, t;
+    poly yrh[M_SGEN];          /* only ys is needed in the NTT domain */
+    y1h = *y1;
+    poly_ntt(&y1h);
+    for (int i = 0; i < M_SGEN; i++) { yrh[i] = y_rest[i]; poly_ntt(&yrh[i]); }
+
+    for (int i = 0; i < K; i++) {
+        poly acc;
+        poly_zero(&acc);
+        /* + Agen * ys  (ys = first L-1 of y_rest) */
+        for (int j = 0; j < M_SGEN; j++)
+            poly_basemul_acc(&acc, &Agen[i][j], &yrh[j]);
+        /* - b*y1 */
+        poly_basemul(&t, &b_ntt[i], &y1h);
+        poly_sub(&acc, &acc, &t);
+        poly_invntt_tomont(&acc);
+        /* + ye_i (standard domain; ye = last K of y_rest) */
+        poly_add(&acc, &acc, (const poly *)&y_rest[M_SGEN + i]);
+        /* mod q, double */
+        for (int j = 0; j < N; j++)
+            w[i].coeffs[j] = 2 * freeze(acc.coeffs[j]);
     }
-    // Now c is in [-Q/2, Q/2] (or close, depending on Q odd/even)
-    return c;
+    /* j-term: row 0 gets q * ((y1 + sub_par*c) mod 2) -- caller folds c parity via sub_par flag:
+     * sign:    sub_par = 0  -> + q*(y1 mod 2)
+     * verify:  sub_par = 1  -> + q*((z1 + c) mod 2), with c added by caller into y1 copy.
+     * Here we only use parity of y1 input. */
+    (void)sub_par;
 }
 
+/* parity j-term applied separately for clarity */
+/*************************************************
+* Name:        add_jterm
+*
+* Description: Adds the q-scaled parity (j-) term to row 0 of the commitment, derived from
+*              the least-significant bits of the given polynomials.
+*
+* Arguments:   - poly w[K]:        commitment vector to update
+*              - const poly *p1:   first parity source polynomial
+*              - const poly *p2:   second parity source polynomial (may be NULL)
+**************************************************/
+static void add_jterm(poly w[K], const poly *p1, const poly *p2 /* may be NULL */) {
+    for (int j = 0; j < N; j++) {
+        int32_t par = p1->coeffs[j];
+        if (p2) par += p2->coeffs[j];
+        par &= 1;
+        w[0].coeffs[j] = freeze2q(w[0].coeffs[j] + par * Q);
+    }
+    for (int i = 1; i < K; i++)
+        for (int j = 0; j < N; j++)
+            w[i].coeffs[j] = freeze2q(w[i].coeffs[j]);
+}
+
+/*************************************************
+* Name:        expand_A
+*
+* Description: Deterministically expands the public matrix A (in NTT domain) from a public
+*              seed via rejection sampling.
+*
+* Arguments:   - poly Agen[K][M_SGEN]:            output matrix in NTT domain
+*              - const uint8_t seedA[SEEDBYTES]:  public seed
+**************************************************/
+static void expand_A(poly Agen[K][M_SGEN], const uint8_t seedA[SEEDBYTES]) {
+    for (int i = 0; i < K; i++)
+        for (int j = 0; j < M_SGEN; j++)
+            poly_uniform_ntt(&Agen[i][j], seedA, (uint16_t)((i << 8) | j));
+}
+
+#ifdef RHYME_PROFILE_SECTIONS
+#include <stdio.h>
+uint64_t rhyme_prof[8];
+/*************************************************
+* Name:        prof_rdtsc
+*
+* Description: Reads the CPU timestamp counter (used only for optional section profiling).
+*
+* Returns:     Current 64-bit timestamp counter value.
+**************************************************/
+static uint64_t prof_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+#define PROF_T(var) uint64_t var = prof_rdtsc()
+#define PROF_ACC(idx, from) do { uint64_t now_ = prof_rdtsc(); rhyme_prof[idx] += now_ - (from); (from) = now_; } while (0)
+#else
+#define PROF_T(var) do {} while (0)
+#define PROF_ACC(idx, from) do {} while (0)
+#endif
+
+/* ---- exact negacyclic products over Z via one 31-bit prime NTT ----
+ * All products in the signing hot path are bounded well below p/2
+ * (max ~2^26 vs p/2 ~ 2^30), so a single-prime NTT with centered lift
+ * is exact and ~20x cheaper than schoolbook.  Bit-identical results. */
+#include "zpntt.h"
+
+/*************************************************
+* Name:        zp_fwd
+*
+* Description: Lifts a polynomial into the auxiliary 31-bit prime NTT domain used for exact
+*              integer products during signing.
+*
+* Arguments:   - uint32_t out[N]:   output residues in the auxiliary NTT domain
+*              - const poly *a:     input polynomial
+**************************************************/
+static void zp_fwd(uint32_t out[N], const poly *a) {
+    uint32_t p = zpntt_prime();
+    for (int i = 0; i < N; i++) {
+        int64_t v = a->coeffs[i] % (int64_t)p;
+        if (v < 0) v += p;
+        out[i] = (uint32_t)v;
+    }
+    zpntt_fwd(out);
+}
+/* c += centered_lift(inv_tomont(h)); h holds Montgomery pointwise products */
+/*************************************************
+* Name:        zp_add_lift
+*
+* Description: Performs the inverse auxiliary-prime NTT on h and accumulates the lifted
+*              result into polynomial c.
+*
+* Arguments:   - poly *c:        accumulator polynomial
+*              - uint32_t h[N]:  residues in the auxiliary NTT domain (consumed)
+**************************************************/
+static void zp_add_lift(poly *c, uint32_t h[N]) {
+    uint32_t p = zpntt_prime();
+    zpntt_inv_tomont(h);
+    for (int i = 0; i < N; i++) {
+        int64_t v = h[i];
+        if (v > p / 2) v -= p;
+        c->coeffs[i] += (int32_t)v;
+    }
+}
+
+/* ------------------------------------------------------------------ keypair */
+
+/*************************************************
+* Name:        crypto_sign_keypair_from_basis
+*
+* Description: Builds a public/secret key pair from an already-solved secret unimodular
+*              basis and a public seed for A.
+*
+* Arguments:   - uint8_t *pk:                     output public key
+*              - uint8_t *sk:                     output secret key
+*              - const secret_basis *B:           solved unimodular basis
+*              - const uint8_t seedA[SEEDBYTES]:  public seed for A
+*
+* Returns:     0 on success, nonzero on failure.
+**************************************************/
+int crypto_sign_keypair_from_basis(uint8_t *pk, uint8_t *sk,
+                                   const secret_basis *B,
+                                   const uint8_t seedA[SEEDBYTES],
+                                   const uint8_t key[SEEDBYTES]) {
+    poly Agen[K][M_SGEN], b[K];
+    expand_A(Agen, seedA);
+
+    /* s_tail = first d entries of column 0 of B = the d SHORT rows' column-0
+     * polys.  (Under cut-F the (d+1)-th entry, row_big[0], is the discarded
+     * extension dimension and is NOT part of s_tail.)
+     * sgen = first L-1 entries, egen = last K entries of s_tail. */
+    poly s_tail[D_UNI];
+    for (int r = 0; r < D_UNI; r++) s_tail[r] = B->row_small[r][0];
+
+    /* b = Agen*sgen + egen mod q */
+    poly sgen_ntt[M_SGEN];
+    for (int j = 0; j < M_SGEN; j++) { sgen_ntt[j] = s_tail[j]; poly_ntt(&sgen_ntt[j]); }
+    for (int i = 0; i < K; i++) {
+        poly acc; poly_zero(&acc);
+        for (int j = 0; j < M_SGEN; j++)
+            poly_basemul_acc(&acc, &Agen[i][j], &sgen_ntt[j]);
+        poly_invntt_tomont(&acc);
+        poly_add(&acc, &acc, &s_tail[M_SGEN + i]);
+        poly_freeze(&acc);
+        b[i] = acc;
+        }
+    pack_pk(pk, seedA, b);
+    pack_sk(sk, pk, B, key);
+    return 0;
+}
 
 /*************************************************
 * Name:        crypto_sign_keypair
 *
-* Description: Generates a public and private key pair for the Rhyme signature scheme.
-* This function implements Algorithm 8 from the Rhyme paper.
+* Description: Generates a Rhyme key pair: samples a fresh random seed, solves the secret
+*              unimodular basis, and encodes the public and secret keys.
 *
-* Arguments:   - uint8_t *pk: pointer to output public key byte array
-* - size_t *pklen: pointer to output length of public key
-* - uint8_t *sk: pointer to output private key byte array
-* - size_t *sklen: pointer to output length of private key
+* Arguments:   - uint8_t *pk:   output public key
+*              - uint8_t *sk:   output secret key
 *
-* Returns:     0 on success.
+* Returns:     0 on success, nonzero on failure.
 **************************************************/
-int crypto_sign_keypair(uint8_t *pk, size_t *pklen, uint8_t *sk, size_t *sklen) {
-    uint8_t seedbuf[SEEDBYTES + CRHBYTES + CRHBYTES + CRHBYTES + SEEDBYTES]; 
-    const uint8_t *seedA, *seedsk, *seed_s_prime, *seed_s_bar_prime, *key; 
+int crypto_sign_keypair(uint8_t *pk, uint8_t *sk) {
+    uint8_t seedbuf[2 * SEEDBYTES + SEEDBYTES];
+    uint8_t root[SEEDBYTES];
+    randombytes(root, SEEDBYTES);
+    shake256(seedbuf, sizeof seedbuf, root, SEEDBYTES);
+    const uint8_t *seedA = seedbuf;
+    const uint8_t *seedB = seedbuf + SEEDBYTES;
+    const uint8_t *key = seedbuf + 2 * SEEDBYTES;
 
-    polyvecm Agen_ntt[K];
-    polyveck b_ntt, ntt_neg_two_b;
-    polyvecm sgen, sgen_ntt;
-    polyveck egen, egen_ntt;
-    polyvecl s_prime;
-    poly s_bar_prime_0; 
-    
-    randombytes(seedbuf, SEEDBYTES);
-    shake256(seedbuf, sizeof(seedbuf), seedbuf, SEEDBYTES);
-    seedA = seedbuf;
-    seedsk = seedA + SEEDBYTES;
-    seed_s_prime = seedsk + CRHBYTES;
-    seed_s_bar_prime = seed_s_prime + CRHBYTES;
-    key = seed_s_bar_prime + CRHBYTES;
-
-    polymatkm_expand_ntt(Agen_ntt, seedA);
-
-    for(int i=0; i < M; ++i) SampleSigma1(&sgen.vec[i], seedsk, (uint16_t)i);
-    for(int i=0; i < K; ++i) SampleSigma1(&egen.vec[i], seedsk, (uint16_t)(M+i));
-    for(int i = 0; i < L + K; ++i) {
-        SampleSigma1(&s_prime.vec[i], seed_s_prime, (uint16_t)i);
-    }
- 
-    SampleSigma1(&s_bar_prime_0, seed_s_bar_prime, 0);
-
-    sgen_ntt = sgen;
-    egen_ntt = egen;
-    polyvecm_ntt(&sgen_ntt);
-    polyveck_ntt(&egen_ntt);
-
-    polymatkm_pointwise_montgomery(&b_ntt, Agen_ntt, &sgen_ntt);
-    polyveck_add(&b_ntt, &b_ntt, &egen_ntt);
-
-    polyveck_negate(&ntt_neg_two_b, &b_ntt);
-    polyveck_freeze(&ntt_neg_two_b);
-    *pklen = pack_pk(pk, seedA, &ntt_neg_two_b);
-    *sklen = pack_sk(sk, pk, *pklen, &sgen, &egen, &s_prime, &s_bar_prime_0, key);
-
-    return 0;
+    secret_basis B;
+    if (rhyme_keygen_basis(&B, seedB) != 0)
+        return -1;
+    return crypto_sign_keypair_from_basis(pk, sk, &B, seedA, key);
 }
 
+/* ------------------------------------------------------------------ sign */
 
 /*************************************************
 * Name:        crypto_sign_signature
 *
-* Description: Computes a signature for a given message.
-* This function implements Algorithm 9 from the Rhyme paper,
-* using an iterative process to find a signature that
-* satisfies the norm bound.
+* Description: Produces a detached Rhyme signature on a message. Runs the Fiat-Shamir loop:
+*              samples masks, computes the commitment w, derives the challenge, forms z via
+*              Algorithm-5 rejection on z1 and the D-term superposition on z_rest, checks the
+*              norm gates, and rANS-encodes the accepted signature.
 *
-* Arguments:   - uint8_t *sig: pointer to output signature byte array
-* - size_t *siglen: pointer to output length of signature
-* - const uint8_t *m: pointer to the message to be signed
-* - size_t mlen: length of the message
-* - const uint8_t *sk: pointer to the private key
+* Arguments:   - uint8_t *sig:       output signature buffer (capacity CRYPTO_BYTES)
+*              - size_t *siglen:     set to the actual signature length
+*              - const uint8_t *m:   message
+*              - size_t mlen:        message length in bytes
+*              - const uint8_t *sk:  secret key
 *
-* Returns:     0 if a signature was successfully generated, -1 otherwise.
+* Returns:     0 on success, nonzero on failure.
 **************************************************/
-int crypto_sign_signature(uint8_t *sig, size_t *siglen, const uint8_t *m,
-                          size_t mlen, const uint8_t *sk)
-{
+int crypto_sign_signature(uint8_t *sig, size_t *siglen,
+                          const uint8_t *m, size_t mlen, const uint8_t *sk) {
+    uint8_t pk[CRYPTO_PUBLICKEYBYTES];
+    uint8_t key[SEEDBYTES], seedA[SEEDBYTES];
+    uint8_t mu[CRHBYTES], rhoprime[CRHBYTES], c_tilde[CTILDEBYTES];
+    uint8_t wbuf[W_PACKEDBYTES];
+    secret_basis B;
+    poly Agen[K][M_SGEN], b[K];
+    poly y1, z1, c, v;
+    poly y_rest[D_REST], z_rest[D_REST];
+    poly w[K];
+    keccak_state ks;
 
-    uint8_t key[SEEDBYTES];
-    uint8_t mu[CRHBYTES];
-    uint8_t c_seed[CRHBYTES];
-    uint8_t seedA[SEEDBYTES];
-    uint8_t pk_temp[CRYPTO_PUBLICKEYBYTES];
-    size_t pklen_temp;
-    xof256_state state;
-    
-    uint8_t seedysc_base[CRHBYTES];
-    uint8_t seedx_base[CRHBYTES];
-    uint8_t iter_seeds_buf[5 * CRHBYTES];
-    uint8_t current_seedx[CRHBYTES];
-    uint16_t count = 0;
-    uint8_t count_bytes[2];
+    zpntt_init();
+    unpack_sk(pk, &B, key, sk);
+    unpack_pk(seedA, b, pk);
+    expand_A(Agen, seedA);
+    for (int i = 0; i < K; i++) poly_ntt(&b[i]);
 
-    poly y0;
-    polyvecd_rest y_rest;
-    poly z0;
-    polyvecd_rest z_rest;
-    stream256_state rng_state;
-    int loop_done;
+    /* s_tail (first d entries of column 0 = the d short rows' col-0 polys)
+     * and B' (columns 1..d of the d short rows). */
+    poly s_tail[D_UNI];
+    for (int r = 0; r < D_UNI; r++) s_tail[r] = B.row_small[r][0];
 
-    polyvecm sgen;
-    polyveck egen;
-    polyvecl s;
-    polyvecl s_prime;
-    poly c;
-    poly x_poly;
-    poly c_plus_x;
-    polyveck w, w_for_hash;
-    uint8_t packed_w[K * POLY_PACKEDBYTES_2Q];
-    poly s_bar_prime_0; 
-    
-    polyvecm Agen_ntt[K];
-    polyveck ntt_neg_two_b, ntt_Col0;
-    
-    unpack_sk(pk_temp, &pklen_temp, &sgen, &egen, &s_prime, &s_bar_prime_0, key, sk, CRYPTO_SECRETKEYBYTES);    
-    unpack_pk(seedA, &ntt_neg_two_b, pk_temp, pklen_temp);
+    /* cache NTT_p forms of 2*B' and s_tail (constant for the whole signature).
+     * B_short = the D_UNI short rows; B' = its columns 1..D_SOLVE-1 (= d columns). */
+    static uint32_t Bhat[D_UNI][D_SOLVE - 1][N];
+    static uint32_t shat[D_UNI][N];
+    for (int r = 0; r < D_UNI; r++) {
+        for (int cidx = 1; cidx < D_SOLVE; cidx++) {
+            const poly *Bent = &B.row_small[r][cidx];   /* always a short row */
+            poly two_b;
+            for (int j = 0; j < N; j++) two_b.coeffs[j] = 2 * Bent->coeffs[j];
+            zp_fwd(Bhat[r][cidx - 1], &two_b);
+        }
+        zp_fwd(shat[r], &s_tail[r]);
+    }
 
-    polymatkm_expand_ntt(Agen_ntt, seedA);
+    /* mu = CRH(pk || m) ; rhoprime = CRH(key || mu) */
+    shake256_init(&ks);
+    shake256_absorb(&ks, pk, CRYPTO_PUBLICKEYBYTES);
+    shake256_absorb(&ks, m, mlen);
+    shake256_finalize(&ks);
+    shake256_squeeze(mu, CRHBYTES, &ks);
 
-    ntt_Col0 = ntt_neg_two_b; 
+    shake256_init(&ks);
+    shake256_absorb(&ks, key, SEEDBYTES);
+    shake256_absorb(&ks, mu, CRHBYTES);
+    shake256_finalize(&ks);
+    shake256_squeeze(rhoprime, CRHBYTES, &ks);
 
-
-    poly_zero(&s.vec[0]); s.vec[0].coeffs[0] = 1;
-    for(int i=0; i < M; ++i) s.vec[1+i] = sgen.vec[i];
-    for(int i=0; i < K; ++i) s.vec[M+1+i] = egen.vec[i];
-
-
-#if ccc_MODE != 2
-    polyvecl s_ntt;
-    s_ntt = s;
-    polyvecl_ntt(&s_ntt); 
+    for (uint16_t iter = 0; iter < MAX_SIGN_ITERATIONS; iter++) {
+        uint16_t base = (uint16_t)(iter * 64);
+#ifdef RHYME_PROFILE_SECTIONS
+        uint64_t tp = prof_rdtsc();
 #endif
 
-    shake256_init(&state);
-    shake256_absorb(&state, pk_temp, pklen_temp);
-    shake256_absorb(&state, m, mlen);
-    shake256_finalize(&state);
-    shake256_squeeze(mu, CRHBYTES, &state);
+        /* y1 and X', e_bottom.  X' has D_SOLVE-1 = d components (the masks for
+         * B' columns 1..d); e_main has D_REST = d components (one per short row). */
+        SampleY1(&y1, rhoprime, base + 0);
+        poly X[D_SOLVE - 1], e[D_REST];
+        for (int i = 0; i < D_SOLVE - 1; i++) SampleGauss(&X[i], rhoprime, (uint16_t)(base + 1 + i));
+        for (int i = 0; i < D_REST; i++)      SampleGauss(&e[i], rhoprime, (uint16_t)(base + 16 + i));
 
-    uint8_t base_seeds_buf[CRHBYTES * 2];
-    shake256_init(&state);
-    shake256_absorb(&state, key, SEEDBYTES);
-    shake256_absorb(&state, mu, CRHBYTES);
-    shake256_finalize(&state);
-    shake256_squeeze(base_seeds_buf, sizeof(base_seeds_buf), &state);
-    memcpy(seedysc_base, base_seeds_buf, CRHBYTES);
-    memcpy(seedx_base, base_seeds_buf + CRHBYTES, CRHBYTES);
-
-    shake256_init(&state);
-    shake256_absorb(&state, seedx_base, CRHBYTES);
-    count_bytes[0] = 0;
-    count_bytes[1] = 0;
-    shake256_absorb(&state, count_bytes, 2);
-    shake256_finalize(&state);
-    shake256_squeeze(current_seedx, CRHBYTES, &state);
-
-    loop_done = 0;
-    while(!loop_done) {
-        count++;
-
-        //global_sign_cycles_count++;
-        
-        //if (count > MAX_SIGN_ITERATIONS) return -1;
-        
-        count_bytes[0] = count & 0xFF;
-        count_bytes[1] = (count >> 8) & 0xFF;
-
-        shake256_init(&state);
-        shake256_absorb(&state, seedysc_base, CRHBYTES);
-        shake256_absorb(&state, count_bytes, 2);
-        shake256_finalize(&state);
-        shake256_squeeze(iter_seeds_buf, sizeof(iter_seeds_buf), &state);
-
-        /* Sample y */
-        SampleY0(&y0, iter_seeds_buf, count); 
-        SampleY_rest(&y_rest, iter_seeds_buf + CRHBYTES, count); 
-
-        /* Compute w = Ay */
-
-        polyvecl y_combined;
-        y_combined.vec[0] = y0; 
-        for(int k=0; k<D_REST; k++) {
-            y_combined.vec[k+1] = y_rest.vec[k]; 
-        }
-
-        calculate_A_vec_prod_crt(&w, Agen_ntt, &ntt_Col0, &y_combined);
-        
-        polyveck_freeze2q(&w);
-
-        w_for_hash = w; 
-        pack_polyveck_2q(packed_w, &w_for_hash);
-
-        shake256_init(&state);
-        shake256_absorb(&state, packed_w, K * POLY_PACKEDBYTES_2Q);
-        shake256_absorb(&state, mu, CRHBYTES);
-        shake256_finalize(&state);
-        shake256_squeeze(c_seed, CRHBYTES, &state);
-        
-        SampleChallenge(&c, c_seed);
-        SampleX_poly(&x_poly, &c, current_seedx, count);
-
-        stream256_init(&rng_state, seedysc_base, count);
-        
-
-        if (!Sample_Z(&z0, &x_poly, &c, &y0, &rng_state)) {
-            continue; 
-        }
-
-        poly_add(&c_plus_x, &c, &x_poly);
-        int z_rest_fail = 0;
-
-
-#if ccc_MODE == 2
-        /* Mode 2: Sparse multiplication */
-        for(int i=0; i < D_REST; ++i) {
-            poly temp;
-            poly_mul_sparse_ternary(&temp, &s.vec[i+1], &c, &x_poly);
-            poly_add(&z_rest.vec[i], &y_rest.vec[i], &temp);
-            if(poly_check_norm_inf(&z_rest.vec[i], B1)) { z_rest_fail = 1; break; }
-        }
-#else
-        /* Mode 3/5: NTT-based multiplication */
-        poly c_plus_x_ntt = c_plus_x;
-        poly_ntt(&c_plus_x_ntt);
-
-        for(int i=0; i < D_REST; ++i) {
-            poly temp;
-            
-            poly_pointwise_montgomery(&temp, &s_ntt.vec[i+1], &c_plus_x_ntt);
-            poly_invntt_tomont(&temp);
-            
-            /* Add and center coefficients */
-            for(int k=0; k<N; k++) {
-                int16_t val = temp.coeffs[k];
-                /* Fast reduction mod 257 */
-                int16_t t = (val & 0xFF) - (val >> 8);
-                
-                if (t > 128) t -= 257;
-                else if (t < -128) t += 257;
-                
-                z_rest.vec[i].coeffs[k] = y_rest.vec[i].coeffs[k] + t;
-            }
-            
-            if(poly_check_norm_inf(&z_rest.vec[i], B1)) { 
-                z_rest_fail = 1; 
-                break; 
+        PROF_ACC(0, tp);
+        /* y_bottom = 2*B'*X' + e via single-prime NTT (exact, cached Bhat).
+         * Sum over the D_SOLVE-1 = d columns of B'; one output per short row. */
+        {
+            uint32_t Xhat[D_SOLVE - 1][N], rowacc[N];
+            uint32_t p = zpntt_prime();
+            for (int cidx = 1; cidx < D_SOLVE; cidx++)
+                zp_fwd(Xhat[cidx - 1], &X[cidx - 1]);
+            for (int r = 0; r < D_UNI; r++) {
+                for (int j = 0; j < N; j++) {
+                    uint64_t t = 0;
+                    for (int cidx = 1; cidx < D_SOLVE; cidx++)
+                        t += zpntt_mont_mul(Bhat[r][cidx - 1][j], Xhat[cidx - 1][j]);
+                    /* each term < p, so t < (D_SOLVE-1)*p < 2^34; reduce by
+                     * conditional subtraction (quotient < D_SOLVE-1 <= 7)
+                     * instead of a 64-bit division. */
+                    while (t >= p) t -= p;
+                    rowacc[j] = (uint32_t)t;
+                }
+                z_rest[r] = e[r];
+                zp_add_lift(&z_rest[r], rowacc);
             }
         }
+        for (int i = 0; i < D_REST; i++) y_rest[i] = z_rest[i];     /* y_bottom */
+
+        /* w = A*y mod 2q */
+        PROF_ACC(1, tp);
+        compute_w(w, (const poly (*)[M_SGEN])Agen, (const poly *)b, &y1, y_rest, 0);
+        PROF_ACC(6, tp);   /* compute_w alone */
+        add_jterm(w, &y1, NULL);
+
+        /* c = H(w, mu) */
+        pack_w(wbuf, w);
+        shake256_init(&ks);
+        shake256_absorb(&ks, wbuf, W_PACKEDBYTES);
+        shake256_absorb(&ks, mu, CRHBYTES);
+        shake256_finalize(&ks);
+        shake256_squeeze(c_tilde, CTILDEBYTES, &ks);
+        PROF_ACC(7, tp);   /* pack_w + hash */
+        SampleChallenge(&c, c_tilde);
+        PROF_ACC(2, tp);   /* challenge only */
+
+        /* z1, v via Algorithm 5 (fresh randomness per iteration) */
+        stream256_state rejst;
+        stream256_init(&rejst, rhoprime, (uint16_t)(base + 48));
+        int sz_ok = Sample_Z(&z1, &v, &c, &y1, &rejst);
+        PROF_ACC(3, tp);
+        if (!sz_ok)
+            continue;
+
+        /* z_bottom = y_bottom + s_tail * v  (exact over Z, cached shat) */
+        {
+            uint32_t vhat[N], w2[N];
+            zp_fwd(vhat, &v);
+            for (int r = 0; r < D_REST; r++) {
+                for (int j = 0; j < N; j++)
+                    w2[j] = zpntt_mont_mul(shat[r][j], vhat[j]);
+                z_rest[r] = y_rest[r];
+                zp_add_lift(&z_rest[r], w2);
+            }
+        }
+
+        /* L_inf bound on z_rest: reject if any |z_rest| > B1 (z1 is already
+         * guaranteed |z1|<=B0 by the Algorithm-5 rejection sampler). */
+        {
+            int linf_bad = 0;
+            for (int r = 0; r < D_REST; r++)
+                if (poly_chknorm(&z_rest[r], B1)) { linf_bad = 1; break; }
+            if (linf_bad) continue;
+        }
+
+        /* global L2 bound */
+        uint64_t sq = 0;
+        poly_sqnorm_acc(&sq, &z1);
+        for (int r = 0; r < D_REST; r++) poly_sqnorm_acc(&sq, &z_rest[r]);
+        PROF_ACC(4, tp);
+        if (sq > RHYME_L2SQ) {
+#ifdef RHYME_DEBUG_L2
+            if (iter < 5) fprintf(stderr, "iter %u: ||z||^2 = %llu vs L2SQ %llu\n",
+                                  iter, (unsigned long long)sq, (unsigned long long)RHYME_L2SQ);
 #endif
-        if (z_rest_fail) {
             continue;
         }
 
-        loop_done = 1;
+#ifdef RHYME_PROFILE_SECTIONS
+        uint64_t tp2 = prof_rdtsc();
+#endif
+        if (pack_sig(sig, siglen, c_tilde, &z1, z_rest) != 0)
+            continue;
+#ifdef RHYME_PROFILE_SECTIONS
+        rhyme_prof[5] += prof_rdtsc() - tp2;
+#endif
+#ifdef RHYME_PROFILE_ITERS
+        fprintf(stderr, "ITERS %u\n", iter + 1);
+#endif
+        return 0;
     }
+    return -1;
+}
 
-    *siglen = pack_sig(sig, &z0, &z_rest, &c);
-    if (*siglen == 0) return -1; 
-
+/*************************************************
+* Name:        crypto_sign
+*
+* Description: Produces a combined signed message sm = signature || message. The true
+*              signature length is stored in the signature header, so no padding is used.
+*
+* Arguments:   - uint8_t *sm:        output signed message
+*              - size_t *smlen:      set to the signed-message length
+*              - const uint8_t *m:   message
+*              - size_t mlen:        message length
+*              - const uint8_t *sk:  secret key
+*
+* Returns:     0 on success, nonzero on failure.
+**************************************************/
+int crypto_sign(uint8_t *sm, size_t *smlen, const uint8_t *m, size_t mlen,
+                const uint8_t *sk) {
+    size_t siglen;
+    /* sign first into the front of sm, then place the message immediately
+     * after the *actual* (variable-length) signature -- no padding. */
+    if (crypto_sign_signature(sm, &siglen, m, mlen, sk))
+        return -1;
+    memmove(sm + siglen, m, mlen);
+    *smlen = siglen + mlen;
     return 0;
 }
 
+/* ------------------------------------------------------------------ verify */
 
 /*************************************************
 * Name:        crypto_sign_verify
 *
-* Description: Verifies a signature against a public key and message.
-* This function implements Algorithm 10 from the Rhyme paper.
+* Description: Verifies a detached Rhyme signature against a message and public key. Decodes
+*              and length-checks the signature (exact-length, malleability-resistant),
+*              re-derives the commitment and challenge, and checks all norm bounds.
 *
-* Arguments:   - const uint8_t *sig: pointer to the signature to be verified
-* - size_t siglen: length of the signature
-* - const uint8_t *m: pointer to the message
-* - size_t mlen: length of the message
-* - const uint8_t *pk: pointer to the public key
-* - size_t pklen: length of the public key
+* Arguments:   - const uint8_t *sig:  signature
+*              - size_t siglen:       signature length
+*              - const uint8_t *m:    message
+*              - size_t mlen:         message length
+*              - const uint8_t *pk:   public key
 *
-* Returns:     0 if the signature is valid, -1 otherwise.
+* Returns:     0 if the signature is valid, nonzero otherwise.
 **************************************************/
-
-
-int crypto_sign_verify(const uint8_t *sig, size_t siglen, const uint8_t *m, size_t mlen,
-                       const uint8_t *pk, size_t pklen)
-{
+int crypto_sign_verify(const uint8_t *sig, size_t siglen,
+                       const uint8_t *m, size_t mlen, const uint8_t *pk) {
     uint8_t seedA[SEEDBYTES];
-    uint8_t mu[CRHBYTES];
-    uint8_t cprime_seed[CRHBYTES];
-    
-    poly z0;
-    polyvecd_rest z_rest; 
-    poly c, cprime;
-    
-    polyvecm Agen_ntt[K];
-    polyveck ntt_neg_two_b, ntt_Col0;
-    polyveck Az_mod_2q;
-    polyveck w_recomputed, w_hash_input;
-    polyveck qcj; 
-    uint8_t packed_w_recomputed[K * POLY_PACKEDBYTES_2Q];
-    
-    xof256_state state;
+    uint8_t mu[CRHBYTES], c_tilde[CTILDEBYTES], c_tilde2[CTILDEBYTES];
+    uint8_t wbuf[W_PACKEDBYTES];
+    poly Agen[K][M_SGEN], b[K];
+    poly z1, c;
+    poly z_rest[D_REST];
+    poly w[K];
+    keccak_state ks;
 
-    if (unpack_pk(seedA, &ntt_neg_two_b, pk, pklen) != 0) {
-         fprintf(stderr, "Error: unpack_pk\n");
+    if (unpack_sig(c_tilde, &z1, z_rest, sig, siglen) != 0)
         return -1;
-    }
 
-    if (unpack_sig(&z0, &z_rest, &c, sig, siglen) != 0) {
-        fprintf(stderr, "Error: unpack_sig\n");
+    /* bounds: |z1|_inf <= B0, |z_rest|_inf <= B1, and ||z||_2^2 <= L2SQ */
+    if (poly_chknorm(&z1, B0)) return -1;
+    uint64_t sq = 0;
+    poly_sqnorm_acc(&sq, &z1);
+    for (int r = 0; r < D_REST; r++) {
+        if (poly_chknorm(&z_rest[r], B1)) return -1;   /* L_inf union bound */
+        poly_sqnorm_acc(&sq, &z_rest[r]);
+    }
+    if (sq > RHYME_L2SQ) return -1;
+
+    unpack_pk(seedA, b, pk);
+    expand_A(Agen, seedA);
+    for (int i = 0; i < K; i++) poly_ntt(&b[i]);
+
+    shake256_init(&ks);
+    shake256_absorb(&ks, pk, CRYPTO_PUBLICKEYBYTES);
+    shake256_absorb(&ks, m, mlen);
+    shake256_finalize(&ks);
+    shake256_squeeze(mu, CRHBYTES, &ks);
+
+    SampleChallenge(&c, c_tilde);
+
+    /* w = A z - q j c mod 2q  ==  2*[(Agen zs + ze - b z1) mod q] + q*((z1+c) mod 2) j */
+    compute_w(w, (const poly (*)[M_SGEN])Agen, (const poly *)b, &z1, z_rest, 1);
+    add_jterm(w, &z1, &c);
+
+    pack_w(wbuf, w);
+    shake256_init(&ks);
+    shake256_absorb(&ks, wbuf, W_PACKEDBYTES);
+    shake256_absorb(&ks, mu, CRHBYTES);
+    shake256_finalize(&ks);
+    shake256_squeeze(c_tilde2, CTILDEBYTES, &ks);
+
+    if (memcmp(c_tilde, c_tilde2, CTILDEBYTES) != 0)
         return -1;
-    }
-
-    // check z0 <= B0
-    if (poly_check_norm_inf(&z0, B0)) {
-        // fprintf(stderr, "Error: z0 norm > B0\n");
-        return -1;
-    }
-    // check z_rest <= B1
-    for(int i=0; i<D_REST; i++) {
-        if (poly_check_norm_inf(&z_rest.vec[i], B1)) {
-            // fprintf(stderr, "Error: z_rest[%d] norm > B1\n", i);
-            return -1;
-        }
-    }
-
-    polymatkm_expand_ntt(Agen_ntt, seedA);
-
-    ntt_Col0 = ntt_neg_two_b; 
-
-    polyvecl z_combined;
-    z_combined.vec[0] = z0;
-    for(int k=0; k<D_REST; k++) {
-        z_combined.vec[k+1] = z_rest.vec[k];
-    }
-
-
-    calculate_A_vec_prod_crt(&Az_mod_2q, Agen_ntt, &ntt_Col0, &z_combined);
-
-    /* Compute w = Az - q*c*j (mod 2q) */
-
-    poly_mul_const(&qcj.vec[0], &c, Q); // qcj[0] = c * Q
-    for(int i = 1; i < K; ++i) {
-        poly_zero(&qcj.vec[i]);     // qcj[1..K-1] = 0
-    }
-    
-    polyveck_sub(&w_recomputed, &Az_mod_2q, &qcj);
-    polyveck_reduce2q(&w_recomputed); 
-
-    // Hash verification
-    shake256_init(&state);
-    shake256_absorb(&state, pk, pklen);
-    shake256_absorb(&state, m, mlen);
-    shake256_finalize(&state);
-    shake256_squeeze(mu, CRHBYTES, &state);
-
-    w_hash_input = w_recomputed;
-    polyveck_freeze2q(&w_hash_input); 
-    pack_polyveck_2q(packed_w_recomputed, &w_hash_input);
-
-    shake256_init(&state);
-    shake256_absorb(&state, packed_w_recomputed, K * POLY_PACKEDBYTES_2Q);
-    shake256_absorb(&state, mu, CRHBYTES);
-    shake256_finalize(&state);
-    shake256_squeeze(cprime_seed, CRHBYTES, &state);
-
-    SampleChallenge(&cprime, cprime_seed);
-
-    if (poly_compare(&c, &cprime) != 0) {
-        return -1; 
-    }
-
-    return 0; 
+    return 0;
 }
-
-
-
-/*************************************************
-* Name:        crypto_sign_sign
-*
-* Description: Standard API wrapper for creating a signed message.
-* The output format is | 2-byte siglen | message | signature |.
-*
-* Arguments:   - uint8_t *sm: pointer to output signed message
-* - size_t *smlen: pointer to output length of signed message
-* - const uint8_t *m: pointer to the message to be signed
-* - size_t mlen: length of the message
-* - const uint8_t *sk: pointer to the private key
-*
-* Returns:     0 on success, -1 on failure.
-**************************************************/
-int crypto_sign_sign(uint8_t *sm, size_t *smlen, const uint8_t *m, size_t mlen,
-                     const uint8_t *sk)
-{
-    size_t siglen; 
-    int ret;
-    const size_t siglen_field_bytes = sizeof(uint16_t); 
-
-    if (!smlen) return -1;
-    *smlen = 0; 
-
-    uint8_t *sig_ptr = sm + siglen_field_bytes + mlen; 
-    ret = crypto_sign_signature(sig_ptr, &siglen, m, mlen, sk);
-
-    if (ret != 0) {
-        
-        return -1; 
-    }
-    if (siglen > UINT16_MAX) {
-        fprintf(stderr, "Error: Actual signature length %zu exceeds the maximum value of uint16_t\n", siglen);
-        return -1; 
-    }
-
-    size_t final_smlen = siglen_field_bytes + mlen + siglen;
-    *smlen = final_smlen;
-
-    sm[0] = (uint8_t)(siglen & 0xFF);
-    sm[1] = (uint8_t)((siglen >> 8) & 0xFF);
-
-    memmove(sm + siglen_field_bytes, m, mlen);
-
-    return 0; 
-}
-
 
 /*************************************************
 * Name:        crypto_sign_open
 *
-* Description: Standard API wrapper for verifying a signed message and
-* recovering the original message.
+* Description: Opens a combined signed message: reads the exact signature length from the
+*              header, splits off the message, verifies the signature, and outputs the
+*              message on success.
 *
-* Arguments:   - uint8_t *m: pointer to output message
-* - size_t *mlen: pointer to output length of message
-* - const uint8_t *sm: pointer to the signed message
-* - size_t smlen: length of the signed message
-* - const uint8_t *pk: pointer to the public key
+* Arguments:   - uint8_t *m:         output message buffer
+*              - size_t *mlen:       set to the message length
+*              - const uint8_t *sm:  signed message
+*              - size_t smlen:       signed-message length
+*              - const uint8_t *pk:  public key
 *
-* Returns:     0 on success, -1 on failure.
+* Returns:     0 if valid (message recovered), nonzero otherwise.
 **************************************************/
- int crypto_sign_open(uint8_t *m, size_t *mlen, const uint8_t *sm, size_t smlen,
-                     const uint8_t *pk, const size_t pklen)
-{
-    const size_t siglen_field_bytes = sizeof(uint16_t); 
-    size_t actual_siglen;
-    size_t calculated_mlen;
-
-    *mlen = 0;
-
-    if (smlen < siglen_field_bytes) {
-        fprintf(stderr, "Error (crypto_sign_open): smlen (%zu) is too small to read signature length field (%zu)\n", smlen, siglen_field_bytes);
+int crypto_sign_open(uint8_t *m, size_t *mlen, const uint8_t *sm, size_t smlen,
+                     const uint8_t *pk) {
+    /* the first two bytes of the signature hold its real total length */
+    if (smlen < 2) return -1;
+    size_t siglen = (size_t)sm[0] | ((size_t)sm[1] << 8);
+    if (siglen < 2 || siglen > smlen) return -1;
+    size_t msglen = smlen - siglen;
+    if (crypto_sign_verify(sm, siglen, sm + siglen, msglen, pk))
         return -1;
-    }
-
-    actual_siglen = (uint16_t)sm[0] | ((uint16_t)sm[1] << 8);
-
-    if (smlen < siglen_field_bytes + actual_siglen) {
-        fprintf(stderr, "Error (crypto_sign_open): smlen (%zu) is less than the signature length field (%zu) + the read signature length (%zu)\n", smlen, siglen_field_bytes, actual_siglen);
-        return -1; 
-    }
-
-    calculated_mlen = smlen - siglen_field_bytes - actual_siglen;
-
-    const uint8_t *message_ptr = sm + siglen_field_bytes;
-    const uint8_t *sig_ptr = sm + siglen_field_bytes + calculated_mlen; 
-
-    if (crypto_sign_verify(sig_ptr, actual_siglen, message_ptr, calculated_mlen, pk, pklen) != 0) {
-        return -1; 
-    }
-
-    *mlen = calculated_mlen;
-    memmove(m, message_ptr, calculated_mlen);
-
-    return 0; 
+    memmove(m, sm + siglen, msglen);
+    *mlen = msglen;
+    return 0;
 }

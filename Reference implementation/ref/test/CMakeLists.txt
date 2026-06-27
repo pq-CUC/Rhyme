@@ -1,9 +1,12 @@
+foreach(MODE 128 256 384 512)
+  add_executable(test_rhyme${MODE} main.c)
+  target_compile_definitions(test_rhyme${MODE} PRIVATE RHYME_MODE=${MODE})
+  target_link_libraries(test_rhyme${MODE} rhyme${MODE} rhyme_rng)
+  add_test(NAME rhyme${MODE}_func COMMAND test_rhyme${MODE})
 
-add_executable(${LIB_NAME2}-main main.c ${CMAKE_SOURCE_DIR}/src/randombytes.c)
-target_link_libraries(${LIB_NAME2}-main ${LIB_NAME2_TEST})
-
-add_executable(${LIB_NAME3}-main main.c ${CMAKE_SOURCE_DIR}/src/randombytes.c)
-target_link_libraries(${LIB_NAME3}-main ${LIB_NAME3_TEST})
-
-add_executable(${LIB_NAME5}-main main.c ${CMAKE_SOURCE_DIR}/src/randombytes.c)
-target_link_libraries(${LIB_NAME5}-main ${LIB_NAME5_TEST})
+  add_executable(test_ntt${MODE} test_ntt.c)
+  target_compile_definitions(test_ntt${MODE} PRIVATE RHYME_MODE=${MODE})
+  target_include_directories(test_ntt${MODE} PRIVATE .)
+  target_link_libraries(test_ntt${MODE} rhyme${MODE} rhyme_rng)
+  add_test(NAME rhyme${MODE}_ntt COMMAND test_ntt${MODE})
+endforeach()

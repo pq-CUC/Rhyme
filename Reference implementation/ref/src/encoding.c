@@ -1,188 +1,202 @@
-#include "encoding.h"
-#include "params.h"        // For K, L, N, B_INFTY
-#include "polyvec.h"       // For polyvecl
-#include "rans_byte.h"     // rANS definitions
-#include "config.h"        // For ccc_NAMESPACE
-#include <string.h>        // For memcpy
 #include <stdint.h>
-#include <stdio.h>         // For fprintf
-#include <stdlib.h>        // For malloc/free
-#include <limits.h>        // For UINT16_MAX
-#include <inttypes.h>      // For PRId32
+#include <string.h>
+#include <stdlib.h>
+#include "params.h"
+#include "encoding.h"
+#include "rans_byte.h"
+#include "rans_freqs.h"
 
-// --- rANS Parameters ---
-#define SCALE_BITS_Z 16  
-#define SCALE_Z (1U << SCALE_BITS_Z) //  65536 
+#define SCALE_BITS 16
 
+/* Construction 4 ("cut-F") split coding, two tables:
+ *   z1 (p=0):           v' = v + B0, hi = v' >> RANS_L1, lo raw.  no escape.
+ *   z_rest rows 0..d-1: sigma_rest table (RANS_LS, RANS_CENTER_S) + ESC.
+ * Every retained z_rest row is a SHORT-row output with identical statistics,
+ * so there is no separate long F-row table.  (RANS_*B mirror RANS_*S for
+ * format compatibility but are unused.)
+ * ESC: 24 raw bits of (v + 2^23). */
+#define ESC_BITS 24
+#define ESC_OFF (1 << 23)
 
+typedef struct {
+    const uint16_t *freq;
+    int nsym;
+    RansEncSymbol *esyms;
+    RansDecSymbol *dsyms;
+    uint16_t *lut;
+} rtable;
+static RansEncSymbol es1[RANS_NZ1], ess[RANS_NZS];
+static RansDecSymbol ds1[RANS_NZ1], dss[RANS_NZS];
+static rtable T1 = { rans_freq_z1, RANS_NZ1, es1, ds1, 0 };
+static rtable TS = { rans_freq_zs, RANS_NZS, ess, dss, 0 };
+static int tables_ready;
 
-#if ccc_MODE == 2 && TAU == 30
-    #include "rans_tables_tau30_split.h" 
-    #define DSYMS_Z0      dsyms_z0_tau30
-    #define ESYMS_Z0      esyms_z0_tau30
-    #define SYMBOL_Z0     symbol_z0_tau30
-    #define DSYMS_Z_REST  dsyms_z_rest_tau30
-    #define ESYMS_Z_REST  esyms_z_rest_tau30
-    #define SYMBOL_Z_REST symbol_z_rest_tau30
-
-#elif ccc_MODE == 3 && TAU == 60 
-    #include "rans_tables_tau60_split.h"
-    #define DSYMS_Z0      dsyms_z0_tau60
-    #define ESYMS_Z0      esyms_z0_tau60
-    #define SYMBOL_Z0     symbol_z0_tau60
-    #define DSYMS_Z_REST  dsyms_z_rest_tau60
-    #define ESYMS_Z_REST  esyms_z_rest_tau60
-    #define SYMBOL_Z_REST symbol_z_rest_tau60
-
-#elif ccc_MODE == 5 && TAU == 128
-    #include "rans_tables_tau128_split.h"
-    #define DSYMS_Z0      dsyms_z0_tau128
-    #define ESYMS_Z0      esyms_z0_tau128
-    #define SYMBOL_Z0     symbol_z0_tau128
-    #define DSYMS_Z_REST  dsyms_z_rest_tau128
-    #define ESYMS_Z_REST  esyms_z_rest_tau128
-    #define SYMBOL_Z_REST symbol_z_rest_tau128
-#else
-    #error "Unsupported ccc_MODE or TAU value for rANS tables in encoding.c."
-#endif
-
-
-#define MIN_VAL (-(B_INFTY - 1))
-#define MAX_VAL (B_INFTY - 1)
-#define NUM_SYMBOLS_Z (MAX_VAL - MIN_VAL + 1)
-#define OFFSET_Z (-MIN_VAL)
-
-/*************************************************
-* Name:        encode_z
-*
-* Description: Compresses a polynomial vector z using range Asymmetric Numeral
-* Systems (rANS) entropy coding.
-*
-* Arguments:   - uint8_t *buf: pointer to the output byte array for the compressed data
-* - const polyvecl *z: pointer to the input polynomial vector z
-*
-* Returns:     The length of the compressed byte array, or 0 on error.
-**************************************************/
-uint16_t encode_z(uint8_t *buf, const polyvecl *z) {
-    size_t total_coeffs = (size_t)(K + L) * N;
-    size_t temp_buf_size = total_coeffs * 3 + 256;
-    uint8_t *encoding_buffer = malloc(temp_buf_size);
-    if (!encoding_buffer) { return 0; }
-    uint8_t *ptr = encoding_buffer + temp_buf_size;
-    RansState rans;
-    uint16_t encoded_size = 0;
-
-    RansEncInit(&rans);
-
-    /* Iterate over polynomial vector (reverse order) */
-    for (size_t vec_idx_rev = 0; vec_idx_rev < K + L; ++vec_idx_rev) {
-        size_t vec_idx = K + L - 1 - vec_idx_rev; 
-        
-        /* Select appropriate encoding and decoding tables */
-        const RansEncSymbol *current_esyms;
-        const RansDecSymbol *current_dsyms; 
-
-        if (vec_idx == 0) {
-            current_esyms = ESYMS_Z0;
-            current_dsyms = DSYMS_Z0;       /* Select z0 table */
-        } else {
-            current_esyms = ESYMS_Z_REST;
-            current_dsyms = DSYMS_Z_REST;  /* Select z_rest table */
-        }
-
-        for (size_t coeff_idx_rev = 0; coeff_idx_rev < N; ++coeff_idx_rev) {
-            size_t coeff_idx = N - 1 - coeff_idx_rev;
-            int32_t val = z->vec[vec_idx].coeffs[coeff_idx];
-            
-            if (val < MIN_VAL || val > MAX_VAL) {
-                 fprintf(stderr, "[MODE %d] Error: Coeff %" PRId32 " out of encodable range [%d, %d] in encode_z!\n",
-                         ccc_MODE, val, MIN_VAL, MAX_VAL);
-                 free(encoding_buffer); return 0;
-            }
-            
-            uint16_t symbol = (uint16_t)(val + OFFSET_Z);
-
-            /* Use current_dsyms for frequency check */
-            if (symbol >= NUM_SYMBOLS_Z || current_dsyms[symbol].freq == 0) {
-                 fprintf(stderr, "[MODE %d] Error: Attempting to encode symbol %u (val %d) with freq 0!\n",
-                         ccc_MODE, symbol, val);
-                 free(encoding_buffer); return 0;
-            }
-
-            /* Use current_esyms for encoding */
-            RansEncPutSymbol(&rans, &ptr, &current_esyms[symbol]);
-
-            if (ptr < encoding_buffer) {
-                 fprintf(stderr, "[MODE %d] Error: rANS temp buffer underflow!\n", ccc_MODE);
-                 free(encoding_buffer); return 0;
-            }
-        }
+static void build_one(rtable *t) {
+    t->lut = malloc((size_t)(1u << SCALE_BITS) * sizeof(uint16_t));
+    uint32_t start = 0;
+    for (int s = 0; s < t->nsym; s++) {
+        RansEncSymbolInit(&t->esyms[s], start, t->freq[s], SCALE_BITS);
+        RansDecSymbolInit(&t->dsyms[s], start, t->freq[s]);
+        for (uint32_t i = 0; i < t->freq[s]; i++) t->lut[start + i] = (uint16_t)s;
+        start += t->freq[s];
     }
-    RansEncFlush(&rans, &ptr);
-    size_t size_encoded_temp = (encoding_buffer + temp_buf_size) - ptr;
-    if (size_encoded_temp > UINT16_MAX) {
-         fprintf(stderr, "[MODE %d] Error: Encoded size %zu exceeds uint16_t limit!\n", ccc_MODE, size_encoded_temp);
-         free(encoding_buffer); return 0;
-    }
-    encoded_size = (uint16_t)size_encoded_temp;
-    memcpy(buf, ptr, encoded_size);
-    free(encoding_buffer);
-    return encoded_size;
+}
+static void build_tables(void) {
+    if (tables_ready) return;
+    build_one(&T1); build_one(&TS);
+    tables_ready = 1;
 }
 
-/*************************************************
-* Name:        decode_z
-*
-* Description: Decompresses a polynomial vector z from a byte array using
-* range Asymmetric Numeral Systems (rANS) entropy decoding.
-*
-* Arguments:   - polyvecl *z: pointer to the output (decompressed) polynomial vector z
-* - const uint8_t *buf: pointer to the input byte array of compressed data
-* - uint16_t size_in: the length of the compressed byte array
-*
-* Returns:     0 on success, non-zero on failure.
-**************************************************/
-int decode_z(polyvecl *z, const uint8_t *buf, uint16_t size_in) {
-    RansState rans;
-    const uint8_t *ptr = buf;
-    const uint8_t *buf_end = buf + size_in;
-    size_t total_coeffs = (size_t)(K + L) * N;
-    size_t coeffs_decoded = 0;
-    
-    if (size_in < 4) { return 1; }
-    if (RansDecInit(&rans, (uint8_t **)&ptr)) { return 2; }
+static const rtable *row_table(int p) {
+    return (p == 0) ? &T1 : &TS;          /* cut-F: every z_rest row uses TS */
+}
+static unsigned row_L(int p)     { return p == 0 ? RANS_L1 : RANS_LS; }
+static int32_t row_center(int p) { return p == 0 ? B0 : RANS_CENTER_S; }
+static int row_has_esc(int p)    { return p != 0; }
 
-    for (size_t vec_idx = 0; vec_idx < K + L; ++vec_idx) {
-        const RansDecSymbol *current_dsyms;
-        const uint16_t *current_lut;
-        
-        if (vec_idx == 0) {
-            current_dsyms = DSYMS_Z0;
-            current_lut   = SYMBOL_Z0;
-        } else {
-            current_dsyms = DSYMS_Z_REST;
-            current_lut   = SYMBOL_Z_REST;
-        }
-        for (size_t coeff_idx = 0; coeff_idx < N; ++coeff_idx) {
-            if (ptr > buf_end) { return 9; }
-            uint16_t slot = RansDecGet(&rans, SCALE_BITS_Z);
-            uint16_t symbol = current_lut[slot];
-            
-            if (symbol >= NUM_SYMBOLS_Z) { return 4; }
-            
-            int32_t val = (int32_t)symbol - OFFSET_Z;
-            z->vec[vec_idx].coeffs[coeff_idx] = val;
-            coeffs_decoded++;
-            
-            RansDecAdvanceSymbol(&rans, (uint8_t **)&ptr, buf_end, &current_dsyms[symbol], SCALE_BITS_Z);
-            
-            if (ptr > buf_end && coeffs_decoded < total_coeffs) { return 5; }
+/* ---------------- raw bit stream (LSB first) ---------------- */
+typedef struct { uint8_t *p; size_t cap, bytes; uint32_t acc; unsigned nbits; } raww;
+static void rw_init(raww *w, uint8_t *p, size_t cap) { w->p = p; w->cap = cap; w->bytes = 0; w->acc = 0; w->nbits = 0; }
+static int rw_put(raww *w, uint32_t v, unsigned bits) {
+    w->acc |= (v & ((bits < 32 ? (1u << bits) : 0u) - 1u)) << w->nbits;
+    w->nbits += bits;
+    while (w->nbits >= 8) {
+        if (w->bytes >= w->cap) return -1;
+        w->p[w->bytes++] = (uint8_t)w->acc;
+        w->acc >>= 8;
+        w->nbits -= 8;
+    }
+    return 0;
+}
+static int rw_flush(raww *w) {
+    if (w->nbits) {
+        if (w->bytes >= w->cap) return -1;
+        w->p[w->bytes++] = (uint8_t)w->acc;
+        w->acc = 0; w->nbits = 0;
+    }
+    return 0;
+}
+typedef struct { const uint8_t *p; size_t len, pos; uint32_t acc; unsigned nbits; } rawr;
+static void rr_init(rawr *r, const uint8_t *p, size_t len) { r->p = p; r->len = len; r->pos = 0; r->acc = 0; r->nbits = 0; }
+static int rr_get(rawr *r, unsigned bits, uint32_t *out) {
+    while (r->nbits < bits) {
+        if (r->pos >= r->len) return -1;
+        r->acc |= (uint32_t)r->p[r->pos++] << r->nbits;
+        r->nbits += 8;
+    }
+    *out = r->acc & ((bits < 32 ? (1u << bits) : 0u) - 1u);
+    r->acc >>= bits;
+    r->nbits -= bits;
+    return 0;
+}
+
+/* ---------------- encode ---------------- */
+size_t encode_z(uint8_t *buf, size_t cap, const poly *z1, const poly z_rest[D_REST]) {
+    build_tables();
+    size_t tmpcap = (size_t)(1 + D_REST) * N * 4 + 256;
+    uint8_t *rtmp = malloc(tmpcap);
+    uint8_t *rawbuf = malloc(tmpcap);
+    if (!rtmp || !rawbuf) { free(rtmp); free(rawbuf); return 0; }
+
+    /* raw low bits in FORWARD coefficient order */
+    raww rw; rw_init(&rw, rawbuf, tmpcap);
+    int err = 0;
+    for (int p = 0; p < 1 + D_REST && !err; p++) {
+        const poly *zp = (p == 0) ? z1 : &z_rest[p - 1];
+        unsigned lbits = row_L(p);
+        int32_t cen = row_center(p);
+        for (int i = 0; i < N && !err; i++) {
+            int32_t v = zp->coeffs[i];
+            int64_t vp = (int64_t)v + cen;
+            if (!row_has_esc(p) || (vp >= 0 && vp <= 2 * (int64_t)cen))
+                err |= rw_put(&rw, (uint32_t)vp & ((1u << lbits) - 1), lbits);
+            else
+                err |= rw_put(&rw, (uint32_t)(v + ESC_OFF), ESC_BITS);
         }
     }
+    if (!err) err |= rw_flush(&rw);
 
-    if (RansDecVerify(&rans)) { return 6; }
-    if (ptr != buf_end) { return 7; }
-    if (coeffs_decoded != total_coeffs) { return 8; }
-    
+    /* rANS symbols pushed in REVERSE order so decode pops forward */
+    RansState rans;
+    RansEncInit(&rans);
+    uint8_t *ptr = rtmp + tmpcap;
+    for (int p = D_REST; p >= 0 && !err; p--) {
+        const poly *zp = (p == 0) ? z1 : &z_rest[p - 1];
+        const rtable *T = row_table(p);
+        unsigned lbits = row_L(p);
+        int32_t cen = row_center(p);
+        int esc_sym = T->nsym - 1;
+        for (int i = N - 1; i >= 0; i--) {
+            int32_t v = zp->coeffs[i];
+            int64_t vp = (int64_t)v + cen;
+            uint32_t hi;
+            if (!row_has_esc(p) || (vp >= 0 && vp <= 2 * (int64_t)cen))
+                hi = (uint32_t)(vp >> lbits);
+            else
+                hi = (uint32_t)esc_sym;
+            RansEncPutSymbol(&rans, &ptr, &T->esyms[hi]);
+            if (ptr < rtmp + 8) { err = 1; break; }
+        }
+    }
+    if (!err) RansEncFlush(&rans, &ptr);
+    size_t rans_len = (size_t)((rtmp + tmpcap) - ptr);
+    size_t total = 2 + rans_len + rw.bytes;
+    if (err || rans_len > 0xFFFF || total > cap) {
+        free(rtmp); free(rawbuf);
+        return 0;
+    }
+    buf[0] = (uint8_t)rans_len;
+    buf[1] = (uint8_t)(rans_len >> 8);
+    memcpy(buf + 2, ptr, rans_len);
+    memcpy(buf + 2 + rans_len, rawbuf, rw.bytes);
+    free(rtmp); free(rawbuf);
+    return total;
+}
+
+/* ---------------- decode ---------------- */
+int decode_z(poly *z1, poly z_rest[D_REST], const uint8_t *buf, size_t len) {
+    build_tables();
+    if (len < 2 + 4) return 1;
+    size_t rans_len = (size_t)buf[0] | ((size_t)buf[1] << 8);
+    if (2 + rans_len > len) return 2;
+    const uint8_t *rstart = buf + 2;
+    const uint8_t *rend = rstart + rans_len;
+    rawr rr; rr_init(&rr, rend, len - 2 - rans_len);
+
+    RansState rans;
+    uint8_t *ptr = (uint8_t *)rstart;
+    if (RansDecInit(&rans, &ptr)) return 3;
+
+    for (int p = 0; p < 1 + D_REST; p++) {
+        poly *zp = (p == 0) ? z1 : &z_rest[p - 1];
+        const rtable *T = row_table(p);
+        unsigned lbits = row_L(p);
+        int32_t cen = row_center(p);
+        int esc_sym = T->nsym - 1;
+        for (int i = 0; i < N; i++) {
+            uint32_t slot = RansDecGet(&rans, SCALE_BITS);
+            uint32_t hi = T->lut[slot];
+            RansDecAdvanceSymbol(&rans, &ptr, rend, &T->dsyms[hi], SCALE_BITS);
+            if (row_has_esc(p) && hi == (uint32_t)esc_sym) {
+                uint32_t raw;
+                if (rr_get(&rr, ESC_BITS, &raw)) return 6;
+                int32_t v = (int32_t)raw - ESC_OFF;
+                int64_t vp = (int64_t)v + cen;
+                if (vp >= 0 && vp <= 2 * (int64_t)cen) return 7;  /* canonicity */
+                zp->coeffs[i] = v;
+            } else {
+                uint32_t lo;
+                if (rr_get(&rr, lbits, &lo)) return 8;
+                int64_t vp = ((int64_t)hi << lbits) | lo;
+                if (vp > 2 * (int64_t)cen) return 9;
+                zp->coeffs[i] = (int32_t)(vp - cen);
+            }
+            if (ptr > rend) return 10;
+        }
+    }
+    if (RansDecVerify(&rans)) return 11;
+    if (ptr != rend) return 12;
+    if (rr.pos != rr.len) return 13;
+    if (rr.nbits && (rr.acc & ((1u << rr.nbits) - 1)) != 0) return 14;
     return 0;
 }

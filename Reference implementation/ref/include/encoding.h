@@ -1,17 +1,19 @@
-// include/encoding.h
-#ifndef CCC_ENCODING_H
-#define CCC_ENCODING_H
-
-#include "params.h"
-#include "polyvec.h"
+#ifndef RHYME_ENCODING_H
+#define RHYME_ENCODING_H
 #include <stdint.h>
 #include <stddef.h>
-#include "config.h"
+#include "params.h"
+#include "poly.h"
 
-#define encode_z ccc_NAMESPACE(encode_z)
-uint16_t encode_z(uint8_t *buf, const polyvecl *z);
+#define encode_z RHYME_NAMESPACE(encode_z)
+#define decode_z RHYME_NAMESPACE(decode_z)
 
-#define decode_z ccc_NAMESPACE(decode_z)
-int decode_z(polyvecl *z, const uint8_t *buf, uint16_t size_in);
+/* Compress (z1, z_rest) into buf (capacity cap).
+ * Layout: [u16 rans_len][rans stream][raw low-bit stream].
+ * Returns total bytes written, or 0 on overflow/error. */
+size_t encode_z(uint8_t *buf, size_t cap, const poly *z1, const poly z_rest[D_REST]);
 
-#endif // CCC_ENCODING_H
+/* Decompress; len must be exact. Returns 0 ok, nonzero error. */
+int decode_z(poly *z1, poly z_rest[D_REST], const uint8_t *buf, size_t len);
+
+#endif

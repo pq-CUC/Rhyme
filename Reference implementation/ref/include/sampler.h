@@ -1,39 +1,31 @@
-#ifndef CCC_SAMPLER_H
-#define CCC_SAMPLER_H
-
+#ifndef RHYME_SAMPLER_H
+#define RHYME_SAMPLER_H
+#include <stdint.h>
 #include "params.h"
 #include "poly.h"
-#include "polyvec.h" // For polyvecl type
-#include <stdint.h>
-#include "fips202.h"   // For stream state if needed directly, or via symmetric.h
-#include "symmetric.h" // For stream states and functions
+#include "symmetric.h"
 
-// Samples polynomial with coefficients {-1, 1}
-void SampleSigma1(poly *p, const uint8_t seed[CRHBYTES], uint16_t nonce);
+#define SampleCBD RHYME_NAMESPACE(SampleCBD)
+#define SampleY1 RHYME_NAMESPACE(SampleY1)
+#define SampleGauss RHYME_NAMESPACE(SampleGauss)
+#define SampleChallenge RHYME_NAMESPACE(SampleChallenge)
+#define Sample_Z RHYME_NAMESPACE(Sample_Z)
 
-void SampleX_poly(poly *x, const poly *c, const uint8_t seed[CRHBYTES], uint16_t nonce);
+/* centered binomial CBD(eta) polynomial (keygen, columns of B) */
+void SampleCBD(poly *p, const uint8_t seed[CRHBYTES], uint16_t nonce);
 
-void SampleY1(polyvecl *y1, const uint8_t seed[CRHBYTES], uint16_t nonce_base);
+/* y1: discrete Gaussian D_{sigma_y} conditioned |y| <= B0+R (CDT) */
+void SampleY1(poly *p, const uint8_t seed[CRHBYTES], uint16_t nonce);
 
-void SampleSPrime(polyvecl *s_prime, const uint8_t seed[CRHBYTES], uint16_t nonce_base);
+/* X' / e_bottom: discrete Gaussian D_{sigma_base} (CDT, tail GMAX) */
+void SampleGauss(poly *p, const uint8_t seed[CRHBYTES], uint16_t nonce);
 
-void SampleY(polyvecl *y,
-             const polyvecl *s_prime,
-             const poly *s_bar_prime_0,         
-             const uint8_t seed_y1[CRHBYTES],
-             const uint8_t seed_c_prime[CRHBYTES],
-             const uint8_t seed_x_prime[CRHBYTES],
-             const uint8_t seed_c_prime2[CRHBYTES], 
-             const uint8_t seed_x_prime2[CRHBYTES], 
-             uint16_t nonce);
+/* binary challenge with TAU ones */
+void SampleChallenge(poly *c, const uint8_t seed[CTILDEBYTES]);
 
-void SampleChallenge(poly *c, const uint8_t seed[CRHBYTES]);
+/* Algorithm 5 over all N coefficients.
+ * outputs z1 (|z1| <= B0) and v (= x + c; v = c mod 2, |v| <= R).
+ * returns 1 on acceptance of all coefficients, 0 on rejection. */
+int Sample_Z(poly *z1, poly *v, const poly *c, const poly *y1, stream256_state *rng);
 
-unsigned int rej_uniform(int16_t *a, unsigned int len, const uint8_t *buf, unsigned int buflen, unsigned int *pos);
-
-void poly_uniform_ntt(poly *a, const uint8_t seed[SEEDBYTES], uint16_t nonce);
-
-void SampleY0(poly *y, const uint8_t seed[CRHBYTES], uint16_t nonce);
-void SampleY_rest(polyvecd_rest *y_rest, const uint8_t seed[CRHBYTES], uint16_t nonce);
-int Sample_Z(poly *z0, poly *x, const poly *c, const poly *y0, stream256_state *state);
-#endif // CCC_SAMPLER_H
+#endif
