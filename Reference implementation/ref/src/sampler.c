@@ -221,7 +221,8 @@ void SampleChallenge(poly *c, const uint8_t seed[CTILDEBYTES]) {
 
 /* ------------------------------------------------------------------ fixed-point exp
  * expm_p63(x) ~= 2^63 * exp(-x) for x in [0, ln2), x given in Q63.
- * Polynomial from Falcon (Pornin), deterministic 64-bit arithmetic. */
+ * Independent degree-12 minimax polynomial (gen/exp_coeffs.py),
+ * deterministic 64-bit arithmetic, no external code. */
 /*************************************************
 * Name:        mul_hi64_shift
 *
@@ -250,12 +251,16 @@ static uint64_t mul_hi64_shift(uint64_t a, uint64_t b, unsigned sh) {
 * Returns:     exp(-x) in Q63 fixed point.
 **************************************************/
 static uint64_t expm_p63(uint64_t x /* Q63, in [0, ln2*2^63) */) {
-    /* Falcon's degree-12 minimax coefficients for exp(-x), Q63. */
+    /* Independently generated degree-12 minimax coefficients for exp(-x) on
+     * [0, ln2), in Q63 fixed point. Produced from a high-precision Chebyshev
+     * fit of exp(-t) (see gen/exp_coeffs.py); evaluated by the nested
+     * recurrence y <- C[u] - (x*y >> 63). Max error <= 2 ulp(Q63) vs the true
+     * function, which is far below the precision the rejection sampler needs. */
     static const uint64_t C[] = {
-        0x00000004741183A3u, 0x00000036548CFC06u, 0x0000024FDCBF140Au,
-        0x0000171D939DE045u, 0x0000D00CF58F6F84u, 0x000680681CF796E3u,
-        0x002D82D8305B0FEAu, 0x011111110E066FD0u, 0x0555555555070F00u,
-        0x155555555581FF00u, 0x400000000002B400u, 0x7FFFFFFFFFFF4800u,
+        0x000000032D4C198Cu, 0x000000335976B94Au, 0x0000024D0828C056u,
+        0x0000171BDCE4F359u, 0x0000D00BFDE063AFu, 0x00068067AD7ABD9Cu,
+        0x002D82D81885A853u, 0x011111110DBF1A21u, 0x0555555554FEF456u,
+        0x1555555555501B05u, 0x3FFFFFFFFFFFD5E5u, 0x7FFFFFFFFFFFFF7Bu,
         0x8000000000000000u
     };
     uint64_t y = C[0];
