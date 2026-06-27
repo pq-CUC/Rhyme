@@ -33,11 +33,40 @@ def row_sigma_rest(m):
     v_marg = sb * sb * (1.0 + 4.0 * D * n * (eta / 2.0))
     return math.sqrt(v_marg)
 
-def pick_L(sigma):
-    L = 0
-    while (2 * 8.5 * sigma) / (1 << L) > 120:
-        L += 1
-    return L
+def real_bits_per_coeff(nbuckets, base, L, sigma, reserve=0):
+    """Expected code length in bits/coeff actually spent by the encoder:
+    L verbatim low bits, plus the high part (hi = v' >> L) coded with the SAME
+    quantized frequencies the emitted table uses (via bucket_probs + normalize).
+    This is the real cost, including integer-frequency rounding, not the ideal
+    Shannon entropy."""
+    ps = bucket_probs(nbuckets, base, L, sigma)
+    f = normalize(ps, reserve=reserve)
+    bits = 0.0
+    for p, fi in zip(ps, f):
+        pf = float(p)
+        if pf > 0.0:
+            bits += pf * (L - math.log2(fi / SCALE))
+    return bits
+
+
+def pick_L(base, sigma, reserve=0, Lmax=16):
+    """Select the split point L that minimizes the real signature size.
+
+    The low L bits of each coefficient are stored verbatim, while the high part
+    is rANS-coded. We sweep every feasible L and return the one with the
+    smallest real bits/coeff, so L is chosen to minimize the signature rather
+    than to match any fixed bucket count. 'base' is B0 for z1 or the center
+    offset for z_rest; 'reserve' matches the ESC reservation of the emitted
+    table."""
+    best_L, best_bits = 0, None
+    for L in range(0, Lmax + 1):
+        nbuckets = ((2 * base) >> L) + 1
+        if nbuckets < 2:
+            break
+        b = real_bits_per_coeff(nbuckets, base, L, sigma, reserve)
+        if best_bits is None or b < best_bits - 1e-9:
+            best_L, best_bits = L, b
+    return best_L
 
 def gauss_cdf(x, sigma):
     return Decimal(0.5) * (1 + Decimal(math.erf(float(x) / (sigma * math.sqrt(2)))))
@@ -66,11 +95,11 @@ def emit_mode(level, out):
     m = MODES[level]
     B0, sy = m["B0"], m["sigma_y"]
     s_rest = row_sigma_rest(m)
-    L1 = pick_L(sy)
-    LS = pick_L(s_rest)
+    cen_s = int(8.5 * s_rest)
+    L1 = pick_L(B0, sy)
+    LS = pick_L(cen_s, s_rest, reserve=1)
     LB = LS                       # big == small under cut-F
     nz1 = ((2 * B0) >> L1) + 1
-    cen_s = int(8.5 * s_rest)
     cen_b = cen_s
     nzs = ((2 * cen_s) >> LS) + 1
     nzb = nzs
