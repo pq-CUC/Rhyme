@@ -331,7 +331,7 @@ int crypto_sign_signature(uint8_t *sig, size_t *siglen,
         SampleY1(&y1, rhoprime, base + 0);
         poly X[D_SOLVE - 1], e[D_REST];
         for (int i = 0; i < D_SOLVE - 1; i++) SampleGauss(&X[i], rhoprime, (uint16_t)(base + 1 + i));
-        for (int i = 0; i < D_REST; i++)      SampleGauss(&e[i], rhoprime, (uint16_t)(base + 16 + i));
+        for (int i = 0; i < D_REST; i++)      SampleGaussE(&e[i], rhoprime, (uint16_t)(base + 16 + i));
 
         PROF_ACC(0, tp);
         /* y_bottom = 2*B'*X' + e via single-prime NTT (exact, cached Bhat).

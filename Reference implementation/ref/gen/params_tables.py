@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
-"""Emit exact per-mode constants + sampler tables for the Rhyme C ref (cut-F).
+"""Emit per-mode constants + sampler tables for the Rhyme C ref (cut-F).
 
-Construction 4 ("cut-F"): keygen builds a (d+1)x(d+1) unimodular matrix B
-whose first d rows are short (CBD-eta) and whose last row is the long
-NTRU-solved row.  Signing uses only B_short = first d short rows (d x D);
-the hiding Gram is G0 = B_short B_short* and the long row never enters z.
-Geometry matches the parameter-selection script build_B_short (d rows x (d+1)
-columns):  v_marg = sigma_base^2 * (1 + 4*D*N*(eta/2)), D = widened matrix column count.
+All published quantities are taken VERBATIM from the parameter table
+(n,q,k,l,eta,D,sigma_base,sigma_y,B0,B1,L2).  Only two corrections are made:
 
-Parameters taken verbatim from Table 7 (Parameters for gaussian).
-sigma values are TRUE standard deviations; rho_s(x)=exp(-x^2/(2 s^2)).
+  * tau : log2 C(n,tau) >= lambda  (binary SampleInBall, NO "+tau" sign term).
+          -> 30/58/113/115 for 128/256/384/512.  (The table's 23/44/77 give
+             |C| ~ 2^108/2^212/2^308 < lambda; only 512's 115 was already right.)
+
+  * e_bottom is sampled at width 2*sigma_base (paper's DZ,2sigma).  A second
+    CDT table `rhyme_cdt_e` (tail RHYME_GMAX_E) is emitted; the signer samples
+    e_bottom from it (SampleGaussE) instead of the sigma_base table rhyme_cdt_g.
+    Required by the HVZK parity-masking step (2*sigma >= eta_eps(2Z)).
 """
-from fractions import Fraction
-import math
 from decimal import Decimal, getcontext
+import math
 getcontext().prec = 80
 
+# ---- table values verbatim (sigma_base/sigma_y/B0/B1/L2 from the new table) ----
 MODES = {
-    128: dict(n=256,  q=3329,  k=2, l=3, eta=2,  sigma_base=Decimal("1.277834"),
-              B0=382, L2=Decimal("4617.82"), DMAT=10),
-    256: dict(n=512,  q=9473,  k=2, l=3, eta=4,  sigma_base=Decimal("1.298280"),
-              B0=582, L2=Decimal("12658.11"), DMAT=10),
-    384: dict(n=512,  q=11777, k=3, l=4, eta=5,  sigma_base=Decimal("1.310093"),
-              B0=599, L2=Decimal("20011.18"), DMAT=14),
-    512: dict(n=1024, q=18433, k=2, l=3, eta=6,  sigma_base=Decimal("1.318410"),
-              B0=903, L2=Decimal("30935.16"), DMAT=10),
+    128: dict(n=256,  q=3329,  k=2, l=3, eta=2, sigma_base=Decimal("1.295870"),
+              sigma_y=122.0, B0=388, B1=581,  L2=Decimal("4685.06"),  DMAT=10),
+    256: dict(n=512,  q=9473,  k=2, l=3, eta=4, sigma_base=Decimal("1.316036"),
+              sigma_y=180.0, B0=598, B1=1219, L2=Decimal("12842.68"), DMAT=10),
+    384: dict(n=512,  q=11777, k=3, l=4, eta=5, sigma_base=Decimal("1.326374"),
+              sigma_y=182.0, B0=605, B1=1654, L2=Decimal("20258.77"), DMAT=14),
+    512: dict(n=1024, q=18433, k=2, l=3, eta=6, sigma_base=Decimal("1.335898"),
+              sigma_y=266.0, B0=916, B1=2209, L2=Decimal("31350.08"), DMAT=10),
 }
-QS = 2**64
-SIGMA_Y = {128: 120.0, 256: 176.0, 384: 180.0, 512: 262.0}
 
 def drho(x, s):
     return (Decimal(x) * Decimal(x) / (2 * Decimal(s) * Decimal(s))).copy_negate().exp()
@@ -38,7 +38,9 @@ def build_mode(level):
     d = k + l - 1
     sb = m["sigma_base"]; st = 2 * sb
     R = math.ceil(5 * float(st))
-    sy = Decimal(SIGMA_Y[level]); B0 = m["B0"]; eta = m["eta"]
+    sy = Decimal(m["sigma_y"]); B0 = m["B0"]; eta = m["eta"]; D = m["DMAT"]
+
+    # rejection constant M + parity-conditioned target tables (width 2*sigma)
     tabs, Ms = {}, {}
     for c in (0, 1):
         V = [v for v in range(-R, R + 1) if (v - c) % 2 == 0]
@@ -51,47 +53,44 @@ def build_mode(level):
             if ssum > Mmin: Mmin = ssum
         Ms[c] = Mmin; tabs[c] = (V, p)
     M = max(Ms.values()) * Decimal("1.000001")
+
+    SCALE = 1 << 63
+    # CDT for y1 (width sigma_y)
     Ymax = B0 + R
     wy = [drho(x, sy) for x in range(0, Ymax + 1)]
     tot = wy[0] + 2 * sum(wy[1:])
-    SCALE = 1 << 63
-    cdt_y = []; acc = Decimal(0)
     probs = [wy[0] / tot] + [2 * wx / tot for wx in wy[1:]]
-    for pr in probs:
-        acc += pr; cdt_y.append(min(int(acc * SCALE), SCALE - 1))
+    cdt_y = []; acc = Decimal(0)
+    for pr in probs: acc += pr; cdt_y.append(min(int(acc * SCALE), SCALE - 1))
     cdt_y[-1] = SCALE - 1
+    # CDT for X' (width sigma_base)
     Gmax = math.ceil(12 * float(sb))
     wg = [drho(x, sb) for x in range(0, Gmax + 1)]
     totg = wg[0] + 2 * sum(wg[1:])
     probsg = [wg[0] / totg] + [2 * wx / totg for wx in wg[1:]]
     cdt_g = []; acc = Decimal(0)
-    for pr in probsg:
-        acc += pr; cdt_g.append(min(int(acc * SCALE), SCALE - 1))
+    for pr in probsg: acc += pr; cdt_g.append(min(int(acc * SCALE), SCALE - 1))
     cdt_g[-1] = SCALE - 1
+    # CDT for e_bottom (width 2*sigma_base)   <-- the fix
+    Gmax_e = math.ceil(12 * float(st))
+    we = [drho(x, st) for x in range(0, Gmax_e + 1)]
+    tote = we[0] + 2 * sum(we[1:])
+    probse = [we[0] / tote] + [2 * wx / tote for wx in we[1:]]
+    cdt_e = []; acc = Decimal(0)
+    for pr in probse: acc += pr; cdt_e.append(min(int(acc * SCALE), SCALE - 1))
+    cdt_e[-1] = SCALE - 1
+
     p63 = {c: [(v, int(tabs[c][1][v] * SCALE)) for v in tabs[c][0]] for c in (0, 1)}
     M_q60 = int(M * (1 << 60))
     L2SQ = int((m["L2"] * m["L2"]).to_integral_value(rounding="ROUND_FLOOR"))
-    # Challenge-space entropy target = the mode's security level lambda (NOT 2*lambda).
-    # tau = smallest weight with log2(C(n,tau)) + tau >= lambda  (binary SampleInBall).
-    bits = level; tau = 1
-    while math.log2(math.comb(n, tau)) + tau < bits: tau += 1
-    # B1: per-coefficient L_inf bound on z_bottom (union bound over d*n coeffs at
-    # ACC_RATE_BOTTOM=0.99), matching the parameter script's linf_union():
-    #   v_marg = sigma_base^2 * (1 + 4*D*N*(eta/2))   (isotropic marginal var,
-    #            with D = DMAT the WIDENED unimodular column count, not d+1)
-    #   per    = (1 - acc) / (d*N)
-    #   B1     = ceil( sqrt(2*v_marg) * erfcinv(per) ) + 1
-    D = m["DMAT"]
-    acc = 0.99
-    v_marg = float(sb) ** 2 * (1.0 + 4.0 * D * n * (eta / 2.0))
-    from scipy.special import erfcinv
-    per = (1.0 - acc) / (d * n)
-    B1 = int(math.ceil(math.sqrt(2.0 * v_marg) * float(erfcinv(per))) + 1)
+
+    tau = 1
+    while math.log2(math.comb(n, tau)) < level: tau += 1
+
     return dict(level=level, n=n, q=q, k=k, l=l, d=d, D=D, eta=eta, tau=tau,
-                B1=B1,
-                sigma_y=float(sy), B0=B0, R=R, Ymax=Ymax, sb=float(sb), st=float(st),
-                cdt_y=cdt_y, cdt_g=cdt_g, Gmax=Gmax, p63=p63, M_q60=M_q60,
-                L2SQ=L2SQ, M=float(M))
+                B1=m["B1"], sigma_y=float(sy), B0=B0, R=R, Ymax=Ymax, sb=float(sb),
+                st=float(st), cdt_y=cdt_y, cdt_g=cdt_g, cdt_e=cdt_e, Gmax=Gmax,
+                Gmax_e=Gmax_e, p63=p63, M_q60=M_q60, L2SQ=L2SQ, M=float(M))
 
 def qinv32(q): return pow(q, -1, 1 << 32)
 
@@ -103,36 +102,34 @@ def emit():
         b = build_mode(level); q = b["q"]
         mont = (1 << 32) % q; mont2 = (mont * mont) % q
         out += [f"#if RHYME_MODE == {level}"]
-        out += [f"#define RHYME_N {b['n']}",
-                f"#define RHYME_Q {q}",
-                f"#define RHYME_DQ {2 * q}",
+        out += [f"#define RHYME_N {b['n']}", f"#define RHYME_Q {q}",
+                f"#define RHYME_DQ {2*q}",
                 f"#define RHYME_QINV {qinv32(q)}U  /* q^-1 mod 2^32 */",
                 f"#define RHYME_MONT {mont}  /* 2^32 mod q */",
                 f"#define RHYME_MONT2 {mont2} /* (2^32)^2 mod q */",
-                f"#define RHYME_K {b['k']}",
-                f"#define RHYME_L {b['l']}",
-                f"#define RHYME_D {b['d']}   /* d = K+L-1 : short rows / retained comps */",
-                f"#define RHYME_DMAT {b['D']}   /* D : widened unimodular matrix dimension (>d+1) */",
-                f"#define RHYME_ETA {b['eta']}",
-                f"#define RHYME_TAU {b['tau']}",
+                f"#define RHYME_K {b['k']}", f"#define RHYME_L {b['l']}",
+                f"#define RHYME_D {b['d']}   /* d = K+L-1 */",
+                f"#define RHYME_DMAT {b['D']}   /* D : widened unimodular dim (>d+1) */",
+                f"#define RHYME_ETA {b['eta']}", f"#define RHYME_TAU {b['tau']}",
                 f"#define RHYME_B0 {b['B0']}",
-                f"#define RHYME_B1 {b['B1']} /* L_inf bound on z_rest (union bound) */",
+                f"#define RHYME_B1 {b['B1']} /* L_inf bound on z_rest (from table) */",
                 f"#define RHYME_R {b['R']}",
-                f"#define RHYME_YMAX {b['Ymax']} /* B0+R, support bound of y1 */",
-                f"#define RHYME_GMAX {b['Gmax']} /* tail bound for sigma_base CDT */",
+                f"#define RHYME_YMAX {b['Ymax']} /* B0+R */",
+                f"#define RHYME_GMAX {b['Gmax']} /* tail, sigma_base CDT (X') */",
+                f"#define RHYME_GMAX_E {b['Gmax_e']} /* tail, 2*sigma_base CDT (e_bottom) */",
                 f"#define RHYME_L2SQ {b['L2SQ']}ULL /* floor(L2^2) */",
                 f"#define RHYME_SIGMAY {int(b['sigma_y'])} /* std of y1/z1 Gaussian */",
                 f"#define RHYME_M_Q60 {b['M_q60']}ULL /* M in Q4.60 */",
-                f"/* sigma_y = {b['sigma_y']}, sigma_base = {b['sb']:.6f}, M = {b['M']:.6f} */",
+                f"/* sigma_y={b['sigma_y']}, sigma_base={b['sb']:.6f}, 2sigma={b['st']:.6f}, M={b['M']:.6f} */",
                 ""]
         def arr(name, vals, ty="uint64_t"):
             lines = [f"static const {ty} {name}[{len(vals)}] = {{"]
             for i in range(0, len(vals), 4):
-                lines.append("    " + ", ".join(f"{v}ULL" if ty == "uint64_t" else str(v) for v in vals[i:i + 4]) + ",")
-            lines.append("};")
-            return lines
+                lines.append("    " + ", ".join(f"{v}ULL" if ty == "uint64_t" else str(v) for v in vals[i:i+4]) + ",")
+            lines.append("};"); return lines
         out += arr("rhyme_cdt_y", b["cdt_y"])
         out += arr("rhyme_cdt_g", b["cdt_g"])
+        out += arr("rhyme_cdt_e", b["cdt_e"])
         for c in (0, 1):
             vs = [v for v, _ in b["p63"][c]]; ps = [p for _, p in b["p63"][c]]
             out += [f"#define RHYME_VLEN_{c} {len(vs)}"]
@@ -143,8 +140,9 @@ def emit():
     open("include/params_tables.h", "w").write("\n".join(out))
     for level in (128, 256, 384, 512):
         b = build_mode(level)
-        print(level, "d=", b["d"], "D=", b["D"], "tau=", b["tau"], "R=", b["R"], "Ymax=", b["Ymax"],
-              "Gmax=", b["Gmax"], "M=", round(b["M"], 4), "L2SQ=", b["L2SQ"])
+        print(level, "tau=", b["tau"], "B0=", b["B0"], "B1=", b["B1"],
+              "R=", b["R"], "Gmax=", b["Gmax"], "Gmax_e=", b["Gmax_e"],
+              "L2SQ=", b["L2SQ"], "M=", round(b["M"],5))
 
 if __name__ == "__main__":
     emit()

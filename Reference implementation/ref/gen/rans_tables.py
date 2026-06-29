@@ -21,16 +21,18 @@ SCALE = 1 << SCALE_BITS
 
 # Table 7 parameters (mirrors gen/params_tables.py)
 MODES = {
-    128: dict(n=256,  q=3329,  k=2, l=3, eta=2,  B0=382, sigma_y=120.0, sigma_base=1.277834, DMAT=10),
-    256: dict(n=512,  q=9473,  k=2, l=3, eta=4,  B0=582, sigma_y=176.0, sigma_base=1.298280, DMAT=10),
-    384: dict(n=512,  q=11777, k=3, l=4, eta=5,  B0=599, sigma_y=180.0, sigma_base=1.310093, DMAT=14),
-    512: dict(n=1024, q=18433, k=2, l=3, eta=6,  B0=903, sigma_y=262.0, sigma_base=1.318410, DMAT=10),
+    128: dict(n=256,  q=3329,  k=2, l=3, eta=2,  B0=388, sigma_y=122.0, sigma_base=1.295870, DMAT=10),
+    256: dict(n=512,  q=9473,  k=2, l=3, eta=4,  B0=598, sigma_y=180.0, sigma_base=1.316036, DMAT=10),
+    384: dict(n=512,  q=11777, k=3, l=4, eta=5,  B0=605, sigma_y=182.0, sigma_base=1.326374, DMAT=14),
+    512: dict(n=1024, q=18433, k=2, l=3, eta=6,  B0=916, sigma_y=266.0, sigma_base=1.335898, DMAT=10),
 }
 
 def row_sigma_rest(m):
     n, eta, sb = m["n"], m["eta"], m["sigma_base"]
     D = m["DMAT"]
-    v_marg = sb * sb * (1.0 + 4.0 * D * n * (eta / 2.0))
+    # e_bottom is sampled at width 2*sigma_base, so the identity-block variance
+    # coefficient is 4 (not 1):  v_marg = sb^2 * (4 + 4*D*n*(eta/2)).
+    v_marg = sb * sb * (4.0 + 4.0 * D * n * (eta / 2.0))
     return math.sqrt(v_marg)
 
 def real_bits_per_coeff(nbuckets, base, L, sigma, reserve=0):

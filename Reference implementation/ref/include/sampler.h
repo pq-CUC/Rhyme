@@ -8,6 +8,7 @@
 #define SampleCBD RHYME_NAMESPACE(SampleCBD)
 #define SampleY1 RHYME_NAMESPACE(SampleY1)
 #define SampleGauss RHYME_NAMESPACE(SampleGauss)
+#define SampleGaussE RHYME_NAMESPACE(SampleGaussE)
 #define SampleChallenge RHYME_NAMESPACE(SampleChallenge)
 #define Sample_Z RHYME_NAMESPACE(Sample_Z)
 
@@ -17,8 +18,12 @@ void SampleCBD(poly *p, const uint8_t seed[CRHBYTES], uint16_t nonce);
 /* y1: discrete Gaussian D_{sigma_y} conditioned |y| <= B0+R (CDT) */
 void SampleY1(poly *p, const uint8_t seed[CRHBYTES], uint16_t nonce);
 
-/* X' / e_bottom: discrete Gaussian D_{sigma_base} (CDT, tail GMAX) */
+/* X': discrete Gaussian D_{sigma_base} (CDT, tail GMAX) */
 void SampleGauss(poly *p, const uint8_t seed[CRHBYTES], uint16_t nonce);
+
+/* e_bottom: discrete Gaussian D_{2*sigma_base} (CDT, tail GMAX_E).
+ * Width 2*sigma is required so that e_bottom mod 2 is ~uniform (parity mask). */
+void SampleGaussE(poly *p, const uint8_t seed[CRHBYTES], uint16_t nonce);
 
 /* binary challenge with TAU ones */
 void SampleChallenge(poly *c, const uint8_t seed[CTILDEBYTES]);

@@ -181,6 +181,29 @@ void SampleGauss(poly *p, const uint8_t seed[CRHBYTES], uint16_t nonce) {
         p->coeffs[i] = cdt_sample(rhyme_cdt_g, RHYME_GMAX + 1, &bs);
 }
 
+/*************************************************
+* Name:        SampleGaussE
+*
+* Description: Samples the parity-masking noise e_bottom from the discrete
+*              Gaussian of width 2*sigma_base via the CDT sampler (table
+*              rhyme_cdt_e, tail RHYME_GMAX_E), deterministically from a seed
+*              and nonce.  The doubled width is what makes e_bottom mod 2
+*              statistically uniform, masking the secret-dependent parity in
+*              the structured component (HVZK proof, Thm 4.3).
+*
+* Arguments:   - poly *p:                       output polynomial
+*              - const uint8_t seed[CRHBYTES]:  seed
+*              - uint16_t nonce:                nonce
+**************************************************/
+void SampleGaussE(poly *p, const uint8_t seed[CRHBYTES], uint16_t nonce) {
+    stream256_state st;
+    bitstream bs;
+    stream256_init(&st, seed, nonce);
+    bs_init(&bs, &st);
+    for (int i = 0; i < N; i++)
+        p->coeffs[i] = cdt_sample(rhyme_cdt_e, RHYME_GMAX_E + 1, &bs);
+}
+
 /* ------------------------------------------------------------------ challenge
  * Binary SampleInBall: TAU coefficients equal to 1, rest 0. */
 /*************************************************
