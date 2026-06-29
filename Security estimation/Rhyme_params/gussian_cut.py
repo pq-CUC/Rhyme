@@ -76,7 +76,7 @@ def find_q_incomplete_ntt(linf, n, deg, count=20):
 def calculate_min_tau(n, bits):
     """Calculate minimum tau for required security bits."""
     for tau in range(1, n + 1):
-        ent = math.log2(math.comb(n, tau)) + tau
+        ent = math.log2(math.comb(n, tau))
         if ent >= bits: return tau, ent
     raise ValueError("n is too small")
 
@@ -269,8 +269,8 @@ def derive():
     rng = np.random.default_rng(RNG_SEED)
     m = K + L
     d = m - 1
-    d_lattice = d * N_DIM
-    base_eta = math.sqrt(math.log(2 * d_lattice * (1 + 1 / EPSILON)) / math.pi)
+    D_lattice = D_MATRIX * N_DIM
+    base_eta = math.sqrt(math.log(2 * D_lattice * (1 + 1 / EPSILON)) / math.pi)
     sigma_base = base_eta / math.sqrt(2 * math.pi)
 
     print("=" * 72)
